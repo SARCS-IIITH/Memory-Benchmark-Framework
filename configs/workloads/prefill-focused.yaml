@@ -1,0 +1,16 @@
+# Prefill-focused: long prompt, few generated tokens.
+#
+# Prefill amortises each weight read across the whole prompt, so it is compute-bound and sits
+# near the compute roof. Use this shape to characterise the other end of the memory story and
+# to give the roofline a second point far from decode.
+name: prefill-focused
+kind: text-generation
+prompt_tokens: 4096
+generate_tokens: 8
+batch_size: 1
+warmup_iters: 2
+repeat: 3
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false

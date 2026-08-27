@@ -1,0 +1,12 @@
+# Balanced: a realistic chat-shaped request.
+name: balanced
+kind: text-generation
+prompt_tokens: 512
+generate_tokens: 64
+batch_size: 1
+warmup_iters: 3
+repeat: 5
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false

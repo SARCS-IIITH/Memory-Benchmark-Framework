@@ -1,0 +1,16 @@
+# Long context: stresses the KV cache rather than the weights.
+#
+# At 16k tokens the KV cache becomes comparable to, or larger than, the weights for a small
+# model -- which is exactly when decode-phase traffic stops being dominated by weight reads.
+# Check the model's max_position_embeddings before using this.
+name: long-context
+kind: text-generation
+prompt_tokens: 16384
+generate_tokens: 32
+batch_size: 1
+warmup_iters: 1
+repeat: 3
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false

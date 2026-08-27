@@ -1,0 +1,16 @@
+# Per-layer attribution: adds an NVTX range around every transformer block.
+#
+# The forward hooks cost a little wall-clock, so this is a separate workload rather than a
+# default. Use it when you want to know which part of a block -- attention or MLP -- accounts
+# for the traffic, and read the result from the Nsight Systems timeline.
+name: layer-attribution
+kind: text-generation
+prompt_tokens: 512
+generate_tokens: 16
+batch_size: 1
+warmup_iters: 2
+repeat: 2
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: true

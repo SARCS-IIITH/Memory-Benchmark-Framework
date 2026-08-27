@@ -1,0 +1,16 @@
+# Decode-focused: short prompt, many generated tokens.
+#
+# The default for memory work. Decode is where an LLM is memory-bound -- every weight in the
+# model is read to produce a single token -- so this shape puts the phase under study in the
+# foreground and keeps prefill cheap.
+name: decode-focused
+kind: text-generation
+prompt_tokens: 128
+generate_tokens: 128
+batch_size: 1
+warmup_iters: 3
+repeat: 5
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false
