@@ -1,0 +1,24 @@
+name: Qwen3-0.6B
+path: /home/sarcs/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+dtype: bfloat16
+attn_implementation: sdpa
+trust_remote_code: false
+task: text-generation
+device_map: null
+tokenizer_path: null
+max_position_embeddings: 40960
+architecture: Qwen3ForCausalLM
+model_type: qwen3
+quantization: null
+num_layers: 28
+hidden_size: 1024
+num_attention_heads: 16
+num_key_value_heads: 8
+head_dim: 128
+vocab_size: 151936
+intermediate_size: 3072
+param_count: 751650164
+weight_bytes_on_disk: 1503300328
+safetensors_files:
+- model.safetensors
+notes: []

@@ -1,0 +1,95 @@
+# Model catalogue for the benchmark suite.
+#
+# Each entry is selectable by its key:  nsbench suite --models qwen3-30b,gemma4-26b
+# Add a model by adding a block here; nothing else in the harness needs to change.
+#
+# `repo` is the HuggingFace repository. Weights are fetched once into the shared store
+# (--store, default /opt/ai-models) and reused by every user on the machine.
+#
+# `family` and `class` drive the grouping in the comparison document. The axis worth
+# reading in these results is dense-vs-sparse: a mixture of experts stores tens of
+# billions of parameters but routes each token through a few billion, so it occupies
+# memory like a large model and moves bytes like a small one. Keeping the two classes
+# labelled is what makes that visible in a table rather than something you have to
+# already know.
+
+store: /opt/ai-models
+
+defaults:
+  dtype: bfloat16
+  attn_implementation: sdpa
+
+models:
+
+  # ---- dense ------------------------------------------------------------------------
+  qwen3-4b:
+    repo: Qwen/Qwen3-4B
+    label: Qwen3 4B
+    family: Qwen3
+    class: dense
+    params: 4.0e9
+
+  qwen35-4b:
+    repo: Qwen/Qwen3.5-4B
+    label: Qwen3.5 4B
+    family: Qwen3.5
+    class: dense
+    params: 4.6e9
+    note: Same size class as Qwen3 4B, one generation newer -- the generational control.
+
+  gemma4-e4b:
+    repo: google/gemma-4-E4B-it
+    label: Gemma 4 E4B
+    family: Gemma4
+    class: dense
+    params: 8.0e9
+    note: >
+      Effective-parameter architecture: more weights are resident than any single token
+      pass reads. Expect resident footprint and per-token traffic to disagree.
+
+  # ---- mixture of experts -----------------------------------------------------------
+  gemma4-26b:
+    repo: google/gemma-4-26B-A4B-it
+    label: Gemma 4 26B-A4B
+    family: Gemma4
+    class: moe
+    params: 26e9
+    active_params: 4e9
+
+  qwen3-30b:
+    repo: Qwen/Qwen3-30B-A3B
+    label: Qwen3 30B-A3B
+    family: Qwen3
+    class: moe
+    params: 30e9
+    active_params: 3e9
+
+  qwen36-35b:
+    repo: Qwen/Qwen3.6-35B-A3B
+    label: Qwen3.6 35B-A3B
+    family: Qwen3.6
+    class: moe
+    params: 35e9
+    active_params: 3e9
+    note: Largest checkpoint in the suite at ~72 GB; the tightest fit on a 128 GB pool.
+
+  nano-omni-30b:
+    repo: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+    label: Nemotron 3 Nano Omni 30B-A3B
+    family: Nemotron3
+    class: moe
+    params: 30e9
+    active_params: 3e9
+    note: >
+      Omni-modal checkpoint benchmarked on its text path only. Its vision and audio
+      towers are resident in memory but are not exercised by a text-generation
+      workload, so its footprint is high relative to the traffic a decode step moves --
+      which is itself the finding, not a measurement error.
+
+# Convenience groups, selectable as --models @name
+groups:
+  all:    [gemma4-e4b, gemma4-26b, qwen3-4b, qwen35-4b, qwen36-35b, qwen3-30b, nano-omni-30b]
+  dense:  [qwen3-0.6b, qwen3-4b, qwen35-4b, gemma4-e4b]
+  moe:    [gemma4-26b, qwen3-30b, qwen36-35b, nano-omni-30b]
+  small:  [qwen3-0.6b, qwen3-4b, qwen35-4b]
+  smoke:  [qwen3-0.6b]
