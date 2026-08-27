@@ -1,0 +1,24 @@
+# Standard: the default. Tier 1 over every kernel in scope, full sections on the heaviest few.
+baseline: true
+nsys:
+  enabled: true
+  trace: cuda,nvtx,cublas,cudnn,osrt
+  cuda_memory_usage: true
+  cuda_um_cpu_page_faults: true
+  cuda_um_gpu_page_faults: true
+  gpu_metrics: true
+  gpu_metrics_frequency: 10000
+  cuda_graph_trace: node
+  capture_range: cudaProfilerApi
+  capture_range_end: stop
+  timeout_s: 3600
+ncu:
+  enabled: true
+  tiers: [1, 2]
+  top_n_kernels: 8
+  nvtx_scope: nsbench.decode_step
+  clock_control: base
+  cache_control: all
+  replay_mode: kernel
+  max_kernels: 4000
+  timeout_s: 7200

@@ -1,0 +1,28 @@
+# Deep: adds tier 3 source-level attribution.
+#
+# Tier 3 needs SASS line information to be useful. Stock PyTorch and cuBLAS kernels generally
+# ship without it, so expect source correlation to be partial or empty for those -- it earns
+# its cost on kernels you compiled yourself with -lineinfo.
+baseline: true
+nsys:
+  enabled: true
+  trace: cuda,nvtx,cublas,cudnn,osrt
+  cuda_memory_usage: true
+  cuda_um_cpu_page_faults: true
+  cuda_um_gpu_page_faults: true
+  gpu_metrics: true
+  gpu_metrics_frequency: 20000
+  cuda_graph_trace: node
+  capture_range: cudaProfilerApi
+  capture_range_end: stop
+  timeout_s: 7200
+ncu:
+  enabled: true
+  tiers: [1, 2, 3]
+  top_n_kernels: 12
+  nvtx_scope: nsbench.decode_step
+  clock_control: base
+  cache_control: all
+  replay_mode: kernel
+  max_kernels: 8000
+  timeout_s: 21600

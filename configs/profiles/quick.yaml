@@ -1,0 +1,27 @@
+# Quick: tier 1 only, no deep dive, no calibration sweep.
+#
+# For iterating on a setup or checking that a new checkpoint loads and profiles at all.
+# Roughly one minute of ncu per 100 kernels in scope.
+baseline: true
+nsys:
+  enabled: true
+  trace: cuda,nvtx,osrt
+  cuda_memory_usage: true
+  cuda_um_cpu_page_faults: false
+  cuda_um_gpu_page_faults: false
+  gpu_metrics: true
+  gpu_metrics_frequency: 10000
+  cuda_graph_trace: node
+  capture_range: cudaProfilerApi
+  capture_range_end: stop
+  timeout_s: 1800
+ncu:
+  enabled: true
+  tiers: [1]
+  top_n_kernels: 5
+  nvtx_scope: nsbench.decode_step
+  clock_control: base
+  cache_control: all
+  replay_mode: kernel
+  max_kernels: 4000
+  timeout_s: 5400
