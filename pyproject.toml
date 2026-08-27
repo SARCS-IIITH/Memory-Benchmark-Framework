@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsight-bench"
+version = "0.1.0"
+description = "Memory-hierarchy benchmarking harness for AI models on NVIDIA DGX Spark (GB10), built on Nsight Systems and Nsight Compute"
+requires-python = ">=3.12"
+readme = "README.md"
+
+[project.scripts]
+nsbench = "nsight_bench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nsight_bench*"]
+
+[tool.setuptools.package-data]
+nsight_bench = ["report/templates/*.html"]

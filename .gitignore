@@ -1,0 +1,34 @@
+# Benchmark output. One directory per run; raw profiler reports run to hundreds of
+# megabytes each, well past GitHub's 100 MB per-file limit. Regenerate with `nsbench run`.
+runs/
+
+# Python build and bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Profiler artefacts, wherever they land outside runs/
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Model checkpoints
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

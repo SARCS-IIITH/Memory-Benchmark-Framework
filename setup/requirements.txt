@@ -1,0 +1,28 @@
+# Core runtime for the nsight_bench harness.
+# torch is installed separately from the cu130 index by create_env.sh -- do NOT pin it here,
+# otherwise pip resolves the CPU-only wheel from PyPI.
+
+transformers>=5.10
+accelerate>=1.13
+safetensors>=0.8
+tokenizers
+sentencepiece
+huggingface-hub
+
+# analysis
+numpy
+pandas
+pyarrow
+
+# reporting
+matplotlib
+jinja2
+
+# platform / process introspection
+nvidia-ml-py
+psutil
+pyyaml
+
+# cli
+typer
+rich
