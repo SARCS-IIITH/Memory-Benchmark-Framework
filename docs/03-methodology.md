@@ -139,9 +139,8 @@ stage starts clean.
 
 The order is not arbitrary:
 
-- **Calibration first**, because nothing measured afterward can be trusted if the byte-accounting
-  derivation itself has not been re-verified. Every DRAM figure produced by any later stage rests
-  on this stage's gate having passed.
+- **Calibration first**, Runs a sweep to determine the roofline plot. Verifies the byte-accounting
+  derivation, which all the following memory traffic data is derived using (Because GB10 lacks DRAM counters)
 - **Baseline second**, before any profiler has touched the GPU. This is the only point in the
   whole run where completely unperturbed timing can be captured -- once Nsight Systems or Nsight
   Compute attach, every duration measured afterward is inflated by instrumentation to some degree.
@@ -206,7 +205,7 @@ The gate passes only if **both** of the following hold:
   traffic starts going somewhere the derivation does not expect, instead of letting every later
   DRAM figure be silently wrong by an unknown factor.
 
-### Bandwidth and compute sweep (unprofiled -- no ncu attached)
+### Bandwidth and compute sweep - Produces the Roofline Plot (unprofiled -- no ncu attached)
 
 The second collection measures achievable bandwidth and compute throughput, and deliberately
 runs with **no profiler attached at all**. Nsight Compute's kernel-replay mode times a
@@ -227,7 +226,7 @@ bandwidth is `bytes touched / elapsed seconds`. A dense bf16 8192&times;8192 GEM
 compute-bound by construction, is timed the same way to establish the achievable compute
 ceiling.
 
-Both ceilings are measured rather than taken from a datasheet, for the same reason: a
+**Both ceilings are measured** rather than taken from a datasheet, for the same reason: a
 datasheet number assumes clock and sparsity conditions no real kernel meets, so plotting
 against it would make every kernel look far from the roof regardless of how well it is
 actually doing.
@@ -647,6 +646,52 @@ per-kernel CSV shape as tier 1 -- there's no separate parsing path to maintain.
 All of this surfaces to a reader in the report's "What limits each phase" section -- a verdict
 banner per phase, the weighted stall-reason table, and a per-kernel table of occupancy, waves per
 SM, and dominant stall reason for the kernels that matter most.
+
+## Stitching it together: how `assemble.py` builds one report from four stages
+
+No single stage's numbers are independently meaningful. Most of the headline figures in either
+report require combining two or three stages' outputs, and `assemble.py` is the one place in the
+codebase where that combination happens. Each stage supplies exactly one thing nothing else can:
+
+- **Calibration** -- trust in the byte-counting substitution, plus the measured roofline
+  ceilings (`peak_dram_bandwidth_gbps`, `peak_l2_bandwidth_gbps`, `peak_compute_gflops`).
+- **Baseline** -- the only honest wall-clock time and footprint, plus the two quantities
+  (resident weight bytes, KV-cache bytes) that define what a *correct* decode step's traffic
+  should look like.
+- **Nsys** -- the structural busy/idle diagnosis and kernel ranking, cheaply, over the whole run.
+- **Ncu** -- the actual bytes moved, and the stall-reason verdicts for why the busiest kernels
+  behave the way they do.
+
+A few worked examples show how these combine -- each one is fully explained in its owning
+stage's section above; this is only the map of who supplies what:
+
+- **Achieved bandwidth** is ncu's phase byte count divided by baseline's real wall time for that
+  phase -- two stages, neither sufficient alone (see *Bandwidth at real latency* in Stage 4).
+- **% of peak bandwidth** takes that achieved figure and divides it by calibration's
+  `peak_dram_bandwidth_gbps` -- three stages now.
+- **Reading that percentage correctly** needs a fourth ingredient: nsys's busy/idle split (see
+  *Busy time* above and Stage 3). The same percentage means "genuinely memory-bound" in a phase
+  that's mostly busy, or "launch-bound, bandwidth is irrelevant" in a phase that's mostly idle --
+  and the stage that decides which reading applies measures neither bytes nor bandwidth.
+- **The decode physics check** judges ncu's measured bytes against an expectation built entirely
+  from baseline's numbers -- resident weight bytes plus KV-cache bytes (see Stage 4's Output
+  subsection). This check cannot run without baseline: it validates ncu against baseline, not
+  ncu against itself.
+- **Footprint agreement** cross-checks baseline's own peak (torch or driver, depending on
+  unified vs. discrete memory) against nsys's independently-collected allocation-timeline peak,
+  with routine gaps -- weights loaded before nsys's capture range opens -- explained rather than
+  flagged (see Stage 3's *Where it feeds downstream*).
+- **The nsys/ncu kernel-count cross-check** reconciles two independently-collected views of the
+  same kernels -- nsys's per-instance-normalised count against ncu's profiled count -- as an
+  internal consistency check rather than a headline figure in its own right.
+- **The L2-effectiveness headline** judges ncu's measured L2 hit rate against calibration's
+  measured L2-vs-DRAM speedup ratio.
+
+Pull any one stage out and whole classes of these figures either stop being computable -- no
+baseline time means no bandwidth denominator at all -- or stop being trustworthy -- no
+calibration gate means no verified ceiling to call a percentage "of peak." That is the actual
+reason the pipeline has four stages feeding one assembly step, rather than four independent
+reports.
 
 ## Statistics
 
