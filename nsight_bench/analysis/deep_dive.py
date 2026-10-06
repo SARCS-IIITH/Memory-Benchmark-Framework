@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..parsers.ncu_parse import NcuReport
+from ..parsers.ncu_parse import NcuReport, base_identifier
 
 #: Warp issue stall reasons, mapped to a readable label and what each implies. Stored as
 #: ratios of warps stalled per active issue cycle.
@@ -140,8 +140,11 @@ class DeepDiveAnalysis:
     kernels: list[KernelDeepDive] = field(default_factory=list)
     available: bool = False
     #: kernel name -> total GPU time across the whole phase, from tier 1's complete
-    #: collection. Used to correct tier 2's launch-ordered sampling bias.
+    #: collection or, without tier 1, from the nsys timeline. Used to correct tier 2's
+    #: launch-ordered sampling bias.
     true_time_by_kernel: dict[str, float] = field(default_factory=dict)
+    #: Which pass supplied :attr:`true_time_by_kernel`: "tier 1", "the nsys timeline" or "".
+    time_source: str = ""
     #: Whether tier 2's sample covered every kernel tier 1 ranked as significant.
     sample_note: str = ""
 
@@ -161,6 +164,7 @@ class DeepDiveAnalysis:
         So the weights come from tier 1, which profiled every kernel in the phase and
         therefore knows the true time distribution, while tier 2 supplies the per-kernel
         stall characteristics it alone can measure. Neither pass can produce this on its own.
+        Without tier 1, the nsys timeline supplies the same distribution (see :func:`analyse`).
         """
         weights = self.true_time_by_kernel or {
             k.name: k.duration_ns for k in self.kernels
@@ -222,6 +226,7 @@ def analyse(
     report: NcuReport | None,
     scope: str = "",
     tier1: NcuReport | None = None,
+    nsys_time_by_base: dict[str, float] | None = None,
 ) -> DeepDiveAnalysis:
     """Reduce a tier-2 ncu report to a :class:`DeepDiveAnalysis`.
 
@@ -230,12 +235,15 @@ def analyse(
         scope: Phase name.
         tier1: The tier-1 collection for the same phase. Supplies the true per-kernel time
             distribution, which corrects tier 2's launch-ordered sampling bias.
+        nsys_time_by_base: Used only when ``tier1`` is None. The phase's total GPU time per
+            base identifier, from the nsys timeline. It plays the same corrective role.
     """
     analysis = DeepDiveAnalysis(scope=scope or (report.scope if report else ""))
     if report is None or not report.kernels:
         return analysis
 
     if tier1 is not None:
+        analysis.time_source = "tier 1"
         for kernel in tier1.kernels:
             analysis.true_time_by_kernel[kernel.name] = (
                 analysis.true_time_by_kernel.get(kernel.name, 0.0) + kernel.duration_ns
@@ -270,6 +278,12 @@ def analyse(
 
     analysis.available = bool(analysis.kernels)
 
+    if tier1 is None and nsys_time_by_base:
+        analysis.time_source = "the nsys timeline"
+        analysis.true_time_by_kernel = _split_by_instantiation(
+            analysis.kernels, nsys_time_by_base
+        )
+
     if analysis.true_time_by_kernel:
         sampled = {k.name for k in analysis.kernels}
         ranked = sorted(
@@ -283,7 +297,7 @@ def analyse(
         analysis.sample_note = (
             f"Tier 2 sampled {len(analysis.kernels)} distinct kernels covering "
             f"{100 * covered_time / total_time:.0f}% of the phase's GPU time; stall shares "
-            "are weighted by tier 1's complete timing, not by the sample."
+            f"are weighted by {analysis.time_source}'s complete timing, not by the sample."
         )
         if missed:
             analysis.sample_note += (
@@ -291,6 +305,35 @@ def analyse(
             )
 
     return analysis
+
+
+def _split_by_instantiation(
+    kernels: list[KernelDeepDive], time_by_base: dict[str, float]
+) -> dict[str, float]:
+    """Spread nsys phase time per base identifier over tier 2's full kernel names.
+
+    nsys and ncu demangle differently, so the two only agree at the base identifier, and one
+    base name (``device_kernel``, say) can cover several template instantiations. Each one
+    sampled gets a share of its base name's phase time in proportion to its sampled time.
+    Base names tier 2 never sampled are kept under the base name, so coverage and "fell
+    outside the sample" still count them.
+    """
+    sampled_by_base: dict[str, float] = {}
+    for kernel in kernels:
+        base = base_identifier(kernel.name)
+        sampled_by_base[base] = sampled_by_base.get(base, 0.0) + kernel.duration_ns
+
+    weights: dict[str, float] = {}
+    for kernel in kernels:
+        base = base_identifier(kernel.name)
+        if base not in time_by_base:
+            continue
+        share = kernel.duration_ns / sampled_by_base[base] if sampled_by_base[base] else 0.0
+        weights[kernel.name] = time_by_base[base] * share
+    for base, time_ns in time_by_base.items():
+        if base not in sampled_by_base:
+            weights[base] = time_ns
+    return weights
 
 
 def _mean(launches: list, metric: str) -> float | None:

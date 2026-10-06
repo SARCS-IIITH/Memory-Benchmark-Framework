@@ -41,9 +41,13 @@ echo "==> 4/4  Full run (plumbing check)"
 # even the smallest workload profiles ~1600 kernels and takes half an hour. The run will
 # report PARTIAL DATA -- that is expected and correct here: this step checks that every
 # stage runs and produces its artefacts, not that the numbers are complete.
+#
+# --tiers 1,2 turns tier 1 back on (it is off by default) so the smoke test keeps
+# exercising both paths: tier 1's byte totals, and tier 2 ranked from the nsys timeline.
 "${NSBENCH}" run \
     --model configs/models/_smoke.yaml \
     --profile configs/profiles/quick.yaml \
+    --tiers 1,2 \
     --prompt-tokens 128 \
     --generate-tokens 8 \
     --repeat 2 \

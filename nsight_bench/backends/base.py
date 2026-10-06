@@ -100,6 +100,9 @@ class Backend(ABC):
         self.model: Any = None
         self.tokenizer: Any = None
         self._loaded = False
+        #: The collector this process serves ("baseline", "nsys" or "ncu"), set by the worker
+        #: before load. Lets a backend keep diagnostic hooks out of profiled runs.
+        self.profile_mode: str = "baseline"
 
     # ---- lifecycle --------------------------------------------------------------------
 

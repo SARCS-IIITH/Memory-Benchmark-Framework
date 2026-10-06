@@ -152,7 +152,9 @@ class BenchmarkOrchestrator:
 
         # ---- 4. nsight compute ----
         if not skip_ncu and self.run_config.profile.ncu.enabled:
-            ncu = NcuRunner(self.run_config, paths, self.profile, self.python).run(config_path)
+            ncu = NcuRunner(self.run_config, paths, self.profile, self.python).run(
+                config_path, nsys_sqlite=(record.nsys or {}).get("sqlite_path"),
+            )
             record.ncu = ncu
             collections = ncu.get("collections", [])
             record.stages_ok["ncu"] = any(c.get("ok") for c in collections)

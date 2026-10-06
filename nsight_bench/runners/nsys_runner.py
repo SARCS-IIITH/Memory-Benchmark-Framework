@@ -30,6 +30,11 @@ from ..platform import PlatformProfile
 from .base import CommandResult, RunPaths, run_command
 
 
+#: Stock nsys metric set -> an extended set in configs/nsys/ that adds ``lts__t_sectors``, so
+#: the timeline carries sampled L2 traffic. Only chips where the extension was verified.
+L2_METRIC_SETS: dict[str, str] = {"gb20b": "gb20b_l2.config"}
+
+
 class NsysRunner:
     """Builds and executes the Nsight Systems collection."""
 
@@ -48,6 +53,16 @@ class NsysRunner:
         self.python = python_executable or sys.executable
 
     # ---- command construction ---------------------------------------------------------
+
+    def gpu_metric_set(self) -> str:
+        """The ``--gpu-metrics-set`` value: the L2-extended file when enabled and known."""
+        stock = self.profile.nsys_gpu_metric_set
+        extended = L2_METRIC_SETS.get(stock)
+        if self.run_config.profile.nsys.sample_l2_traffic and extended:
+            path = Path(__file__).resolve().parents[2] / "configs" / "nsys" / extended
+            if path.exists():
+                return f"file:{path}"
+        return stock
 
     def build_command(self, config_path: Path, result_path: Path, report_stem: Path) -> list[str]:
         cfg = self.run_config.profile.nsys
@@ -76,7 +91,7 @@ class NsysRunner:
         if cfg.gpu_metrics and self.profile.nsys_gpu_metric_set:
             argv += [
                 "--gpu-metrics-devices=0",
-                f"--gpu-metrics-set={self.profile.nsys_gpu_metric_set}",
+                f"--gpu-metrics-set={self.gpu_metric_set()}",
                 f"--gpu-metrics-frequency={cfg.gpu_metrics_frequency}",
             ]
 
@@ -122,7 +137,7 @@ class NsysRunner:
             "report_path": str(report_path) if report_path.exists() else None,
             "worker_result_path": str(result_path) if result_path.exists() else None,
             "gpu_state": gpu.window.to_dict() if gpu.window else None,
-            "gpu_metric_set": self.profile.nsys_gpu_metric_set or None,
+            "gpu_metric_set": (self.gpu_metric_set() if cfg.gpu_metrics else None) or None,
             "cpu_sampling": self.profile.permissions.nsys_cpu_sampling_available,
         }
 

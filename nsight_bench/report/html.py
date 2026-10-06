@@ -473,8 +473,11 @@ def _hierarchy(analysis: RunAnalysis) -> str:
         panels.append(
             '<div>' + hbar_panel(
                 phase.label, data, series_index=index,
-                subtitle=f"{phase.hierarchy.kernel_count} kernels, "
-                         f"{fmt_time_ns(phase.hierarchy.gpu_time_ns)} GPU time",
+                subtitle=(
+                    f"{phase.hierarchy.kernel_count} kernels, "
+                    f"{fmt_time_ns(phase.hierarchy.gpu_time_ns)} GPU time"
+                    if phase.traffic_collected else "ncu tier 1 not collected"
+                ),
             ) + "</div>"
         )
     parts.append(f'<div class="panels">{"".join(panels)}</div>')
@@ -527,7 +530,8 @@ def _hierarchy(analysis: RunAnalysis) -> str:
         achieved = hierarchy.achieved_dram_bandwidth_gbps
         bw_rows.append([
             analysis.phases[scope].label,
-            fmt_time_ns(hierarchy.gpu_time_ns),
+            fmt_time_ns(hierarchy.gpu_time_ns)
+            if analysis.phases[scope].traffic_collected else NOT_MEASURED,
             fmt_bandwidth(achieved),
             fmt_pct(100 * achieved / ceiling) if achieved and ceiling else NOT_MEASURED,
             fmt_flops(hierarchy.total_flops),
@@ -551,11 +555,13 @@ def _hierarchy(analysis: RunAnalysis) -> str:
             fmt_time_ns(occupancy["wall_ns_per_instance"]),
             fmt_time_ns(occupancy["gpu_busy_ns_per_instance"]),
             f"{occupancy['busy_pct']:.0f}%",
+            fmt_bytes(analysis.phases[scope].nsys_l2_bytes),
         ])
     if busy_rows:
         parts.append("<h3>Was the GPU actually busy?</h3>")
         parts.append(_table(
-            ["Phase", "Wall (unprofiled trace)", "GPU executing", "Busy"], busy_rows,
+            ["Phase", "Wall (unprofiled trace)", "GPU executing", "Busy", "L2 traffic (nsys)"],
+            busy_rows,
         ))
         parts.append(
             "<p>Busy time is the union of kernel intervals inside the phase’s NVTX "
@@ -563,6 +569,10 @@ def _hierarchy(analysis: RunAnalysis) -> str:
             "kernels — launch latency, or the host blocking on a synchronisation. It is "
             "neither bandwidth nor compute, and no figure above accounts for it: they all "
             "divide by kernel time, so they describe the busy fraction only.</p>"
+            "<p>L2 traffic (nsys) is all L2 traffic per phase instance, sampled by nsys at no "
+            "extra cost. It is an upper bound on DRAM traffic: on Qwen3-0.6B it ran 6–10% "
+            "above ncu’s DRAM bytes for decode, and about 1.9× for prefill, where "
+            "activations are reused in L2.</p>"
         )
         for scope in scopes:
             phase = analysis.phases[scope]
@@ -799,7 +809,8 @@ def _expectation(analysis: RunAnalysis) -> str:
         rows.append(["Recurrent state written back", fmt_bytes(expectation.state_write_bytes)])
     rows += [
         ["Expected total", fmt_bytes(expectation.expected_bytes)],
-        ["Measured", fmt_bytes(expectation.measured_bytes)],
+        ["Measured" + (" (nsys-sampled L2)" if expectation.measured_source == "nsys_l2"
+                       else ""), fmt_bytes(expectation.measured_bytes)],
         ["Ratio", fmt_ratio(ratio)],
     ]
     return (

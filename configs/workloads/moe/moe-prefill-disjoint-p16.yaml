@@ -1,0 +1,14 @@
+# MoE short prefill: routing=disjoint -- each token in a pass gets its own 8 experts, rotating every step (worst case, most bytes).
+# Routing is applied by nsight_bench/compat/routing.py; see docs/07-moe-routing.md.
+name: moe-prefill-disjoint-p16
+kind: text-generation
+prompt_tokens: 16
+generate_tokens: 4
+batch_size: 1
+warmup_iters: 2
+repeat: 3
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false
+routing: disjoint

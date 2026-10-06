@@ -160,9 +160,9 @@ Check the link before blaming the hub or concluding a transfer is wedged; `nsben
 distinguishes the two, since a slow transfer still advances its percentage and a dead one
 does not.
 
-`--profile configs/profiles/quick.yaml` is roughly 3–5x faster and still produces the
-traffic and bandwidth comparison; it drops the tier-2 deep dive, so the "why is it slow"
-section is empty.
+`--profile configs/profiles/quick.yaml` deep-dives the top 5 kernels instead of 8. Neither
+profile collects ncu tier 1 any more, so neither produces the traffic and bandwidth
+comparison unless `--tiers 1,2` is passed; see [04-usage.md](04-usage.md#choosing-a-profile).
 
 ## Launch-count sizing
 

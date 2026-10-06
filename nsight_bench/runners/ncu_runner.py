@@ -19,15 +19,28 @@ Two things keep it tractable, and both are load-bearing:
    which is cheap. Tier 2 then spends the expensive full-section budget on only the handful
    of kernels that tier 1 showed actually matter.
 
-Tier 2 selects its kernels from *tier 1's own export*, reduced to the base identifiers
-ncu's ``--kernel-name`` filter actually matches on. Two naming mismatches make this fiddly and
-both bite silently, since ncu reports either as the generic "No kernels were profiled":
+Tier 1 is optional (``ncu.tiers``) and off by default. On an eager mixture of experts a
+phase runs tens of thousands of launches, so tier 1 takes hours and still ends truncated at
+the launch cap.
 
-* nsys and ncu demangle differently, so a regex built from the Nsight Systems timeline will
-  not match what ncu matches against.
+Tier 2 needs a top-N kernel list, which comes from ``ncu.rank_source``:
+
+* ``nsys`` (default): per-kernel GPU time from the Nsight Systems timeline, attributed to the
+  phase by the NVTX range that launched it. It is free, since the nsys pass has already run,
+  and it covers every instance of the phase at real clocks.
+* ``tier1``: tier 1's own export, the original behaviour.
+
+Each falls back to the other when it has nothing for a phase. Either way the names are
+reduced to the base identifiers ncu's ``--kernel-name`` filter actually matches on. Two
+naming mismatches make this fiddly and both bite silently, since ncu reports either as the
+generic "No kernels were profiled":
+
+* nsys and ncu demangle differently, so a regex built from full nsys names will not match
+  what ncu matches against. Reducing both to the bare function identifier with
+  :func:`base_kernel_name` makes them agree.
 * ncu's own CSV export and its own filter disagree: the export carries the full demangled
   signature while, under ``--kernel-name-base function``, the filter wants the bare
-  identifier. :func:`base_kernel_name` bridges that.
+  identifier. :func:`base_kernel_name` bridges that too.
 
 Prefill and decode are collected separately, in their own processes. That costs a second
 model load, but it is the only way to be certain a metric belongs to the phase it is filed
@@ -235,31 +248,50 @@ class NcuRunner:
 
     # ---- execution --------------------------------------------------------------------
 
-    def run(self, config_path: Path) -> dict:
+    def run(self, config_path: Path, nsys_sqlite: str | Path | None = None) -> dict:
+        """Run every configured tier over each scope.
+
+        ``nsys_sqlite`` is the exported timeline from this run's nsys pass. It is used to rank
+        kernels for tier 2+ when ``rank_source`` is ``nsys``, or as the fallback otherwise.
+        """
         cfg = self.run_config.profile.ncu
         collections: list[NcuCollection] = []
         gpu_windows: dict[str, dict] = {}
+        ranking: dict[str, dict] = {}
+        deep_tiers = sorted(t for t in cfg.tiers if t >= 2)
+        nsys_ranked: dict[str, list[str]] | None = None
 
         for scope, nvtx_range in SCOPES:
-            with GpuStateRecorder() as gpu:
-                tier1 = self._collect_tier1(config_path, scope, nvtx_range)
-            collections.append(tier1)
-            gpu_windows[scope] = gpu.window.to_dict() if gpu.window else {}
+            tier1: NcuCollection | None = None
+            if 1 in cfg.tiers:
+                with GpuStateRecorder() as gpu:
+                    tier1 = self._collect_tier1(config_path, scope, nvtx_range)
+                collections.append(tier1)
+                gpu_windows[scope] = gpu.window.to_dict() if gpu.window else {}
 
-            if not tier1.ok:
+            if not deep_tiers:
                 continue
 
-            top_kernels = self.rank_kernels(tier1.csv_path, cfg.top_n_kernels)
-            for tier in sorted(t for t in cfg.tiers if t >= 2):
+            # Parsed once, and only when some scope actually needs it.
+            if nsys_ranked is None and (cfg.rank_source == "nsys" or not (tier1 and tier1.ok)):
+                nsys_ranked = self.rank_kernels_from_nsys(nsys_sqlite, cfg.top_n_kernels)
+
+            top_kernels, source = self._choose_ranking(scope, nvtx_range, tier1, nsys_ranked)
+            ranking[scope] = {"source": source, "kernels": top_kernels}
+            for tier in deep_tiers:
                 if not top_kernels:
                     collections.append(NcuCollection(
                         scope=scope, tier=tier,
-                        error="tier 1 produced no kernels to rank; nothing to deep-dive",
+                        error="no kernel ranking for this phase: the nsys timeline has no "
+                              "kernels attributed to it and tier 1 was not collected or "
+                              "failed; nothing to deep-dive",
                     ))
                     continue
-                collections.append(
-                    self._collect_tier_n(config_path, scope, nvtx_range, tier, top_kernels)
-                )
+                with GpuStateRecorder() as gpu:
+                    collections.append(
+                        self._collect_tier_n(config_path, scope, nvtx_range, tier, top_kernels)
+                    )
+                gpu_windows.setdefault(scope, gpu.window.to_dict() if gpu.window else {})
 
         truncated = [c for c in collections if c.truncated]
         warnings = [
@@ -274,6 +306,8 @@ class NcuRunner:
             "runner": self.name,
             "scopes": [s for s, _ in SCOPES],
             "tiers": list(cfg.tiers),
+            "rank_source": cfg.rank_source,
+            "ranking": ranking,
             "top_n_kernels": cfg.top_n_kernels,
             "max_kernels": cfg.max_kernels,
             "launch_cap_used": self.launch_cap(),
@@ -366,16 +400,64 @@ class NcuRunner:
         csv_path.write_text(stdout_path.read_text(errors="replace"))
         return csv_path
 
+    def _choose_ranking(
+        self, scope: str, nvtx_range: str, tier1: NcuCollection | None,
+        nsys_ranked: dict[str, list[str]] | None,
+    ) -> tuple[list[str], str]:
+        """Pick the tier-2 kernel list for one scope: the preferred source, else the other."""
+        cfg = self.run_config.profile.ncu
+        tier1_names = (
+            self.rank_kernels(tier1.csv_path, cfg.top_n_kernels)
+            if tier1 is not None and tier1.ok else []
+        )
+        nsys_names = (nsys_ranked or {}).get(nvtx_range, [])
+        order = (
+            [("nsys", nsys_names), ("tier1", tier1_names)] if cfg.rank_source == "nsys"
+            else [("tier1", tier1_names), ("nsys", nsys_names)]
+        )
+        for source, names in order:
+            if names:
+                return names, source
+        return [], "none"
+
+    def rank_kernels_from_nsys(
+        self, sqlite_path: str | Path | None, top_n: int
+    ) -> dict[str, list[str]]:
+        """Rank kernels per phase by GPU time from the nsys timeline.
+
+        Returns ``NVTX range -> top N base identifiers``. Kernels are attributed to a phase by
+        the NVTX range their launching runtime call sat in (see
+        :func:`~nsight_bench.parsers.nsys_parse.parse_sqlite`), summed over every instance of
+        the phase, and grouped by :func:`base_kernel_name` so the names are exactly what ncu's
+        ``--kernel-name`` filter matches.
+
+        Durations here are real-clock and warm-cache, unlike tier 1's, which are measured at
+        base clocks with caches flushed before every replay. Only the ordering is used.
+        """
+        if not sqlite_path or not Path(sqlite_path).exists():
+            return {}
+        from ..parsers.nsys_parse import parse_sqlite
+
+        report = parse_sqlite(sqlite_path)
+        return {
+            nvtx_range: [
+                name for name, _, _ in
+                report.top_kernels(nvtx_range, top_n, key=base_kernel_name)
+            ]
+            for _, nvtx_range in SCOPES
+        }
+
     def rank_kernels(self, csv_path: Path | None, top_n: int) -> list[str]:
-        """Rank kernels by measured GPU time, returning the top N names.
+        """Rank kernels by tier 1's measured GPU time, returning the top N names.
 
         Deep-diving anything else would spend the expensive full-section budget on kernels
         that contribute nothing to the phase's runtime.
 
-        Ranking uses tier 1's own export, so the names handed to tier 2's ``--kernel-name``
-        filter are exactly the strings ncu itself produced. Ranking from the Nsight Systems
-        timeline instead would give demangled full template signatures, which do not match
-        what ncu matches against.
+        Used when ``rank_source`` is ``tier1``, or as the fallback when the nsys timeline has
+        nothing for a phase. The names come from ncu's own export; :func:`_kernel_regex`
+        reduces them to base identifiers so they match tier 2's ``--kernel-name`` filter. Tier 1's view is only
+        as complete as its launch cap allows, so on a truncated collection this ranking
+        favours the kernels that launch earliest.
         """
         if not csv_path or not csv_path.exists():
             return []

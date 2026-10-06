@@ -18,7 +18,8 @@ nsys:
   timeout_s: 7200
 ncu:
   enabled: true
-  tiers: [1, 2, 3]
+  tiers: [2, 3]         # [1, 2, 3] = tier 1 back on
+  rank_source: nsys     # or tier1: rank from tier 1's own export (needs 1 in tiers)
   top_n_kernels: 12
   nvtx_scope: nsbench.decode_step
   clock_control: base

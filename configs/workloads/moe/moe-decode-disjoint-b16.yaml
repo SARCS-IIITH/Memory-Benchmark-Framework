@@ -1,0 +1,14 @@
+# MoE decode sweep: routing=disjoint -- each token in a pass gets its own 8 experts, rotating every step (worst case, most bytes).
+# Routing is applied by nsight_bench/compat/routing.py; see docs/07-moe-routing.md.
+name: moe-decode-disjoint-b16
+kind: text-generation
+prompt_tokens: 128
+generate_tokens: 32
+batch_size: 16
+warmup_iters: 3
+repeat: 5
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false
+routing: disjoint

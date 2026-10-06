@@ -22,7 +22,7 @@ from .. import stats
 from ..calibration import CalibrationResult
 from ..config import ModelConfig, RunConfig, WorkloadConfig
 from ..metrics import Level
-from ..parsers.ncu_parse import NcuReport, parse_csv
+from ..parsers.ncu_parse import NcuReport, base_identifier, parse_csv
 from ..parsers.nsys_parse import NsysReport, parse_sqlite
 from ..platform import PlatformProfile
 from .deep_dive import DeepDiveAnalysis, analyse as analyse_deep_dive
@@ -37,6 +37,7 @@ from .derive import (
 #: NVTX phase name -> ncu scope key. The ncu collections are filed by scope; the nsys
 #: timeline uses the raw NVTX range names.
 PHASE_TO_SCOPE = {"nsbench.prefill": "prefill", "nsbench.decode_step": "decode_step"}
+SCOPE_TO_PHASE = {scope: phase for phase, scope in PHASE_TO_SCOPE.items()}
 
 
 @dataclass
@@ -60,6 +61,13 @@ class PhaseAnalysis:
     occupancy: dict | None = None
     truncated: bool = False
     launch_cap: int = 0
+    #: False when tier 1 was not collected for this phase. The phase then exists only for
+    #: its tier-2 deep dive, and every byte, hit-rate and bandwidth figure is absent (None),
+    #: not zero.
+    traffic_collected: bool = True
+    #: L2 traffic per instance of this phase, sampled by nsys (``nsys.sample_l2_traffic``).
+    #: Independent of ncu, so present even when tier 1 was off or ncu was skipped.
+    nsys_l2_bytes: float | None = None
 
     @property
     def label(self) -> str:
@@ -134,6 +142,8 @@ class PhaseAnalysis:
         return {
             "scope": self.scope,
             "label": self.label,
+            "traffic_collected": self.traffic_collected,
+            "nsys_l2_bytes_per_instance": self.nsys_l2_bytes,
             "hierarchy": self.hierarchy.to_dict(),
             "expectation": self.expectation.to_dict() if self.expectation else None,
             "nsys_kernel_time_ns": self.nsys_kernel_time_ns,
@@ -687,24 +697,66 @@ def _load_phases(analysis: RunAnalysis, manifest: dict) -> None:
         for r in collections
     }
 
-    for (scope, tier), report in sorted(by_scope_tier.items()):
-        if tier != 1:
+    scopes = sorted({scope for scope, _ in by_scope_tier})
+    no_traffic: list[str] = []
+    for scope in scopes:
+        report = by_scope_tier.get((scope, 1))
+        deep_dive = by_scope_tier.get((scope, 2))
+        if report is None and deep_dive is None:
             continue
-        hierarchy = summarize(report, scope=scope)
-        truncated, cap = truncation.get((scope, 1), (False, 0))
-        phase = PhaseAnalysis(
-            scope=scope,
-            hierarchy=hierarchy,
-            kernel_rows=kernel_traffic_rows(report),
-            ncu_report=report,
-            deep_dive=by_scope_tier.get((scope, 2)),
-            truncated=truncated,
-            launch_cap=cap,
-        )
-        phase.limits = analyse_deep_dive(phase.deep_dive, scope, tier1=phase.ncu_report)
+        if report is not None:
+            hierarchy = summarize(report, scope=scope)
+            truncated, cap = truncation.get((scope, 1), (False, 0))
+            phase = PhaseAnalysis(
+                scope=scope,
+                hierarchy=hierarchy,
+                kernel_rows=kernel_traffic_rows(report),
+                ncu_report=report,
+                deep_dive=deep_dive,
+                truncated=truncated,
+                launch_cap=cap,
+            )
+            phase.limits = analyse_deep_dive(deep_dive, scope, tier1=report)
+        else:
+            # Tier 1 off (ncu.tiers): only the deep dive exists. Its stall shares are
+            # weighted by the nsys timeline's per-kernel time in place of tier 1's.
+            hierarchy = HierarchySummary(scope=scope)
+            phase = PhaseAnalysis(
+                scope=scope, hierarchy=hierarchy, deep_dive=deep_dive,
+                traffic_collected=False,
+            )
+            nvtx_phase = SCOPE_TO_PHASE.get(scope)
+            nsys_times = (
+                {name: float(total) for name, (total, _) in
+                 analysis.nsys.kernel_time_by_name(nvtx_phase, key=base_identifier).items()}
+                if analysis.nsys and nvtx_phase else None
+            )
+            phase.limits = analyse_deep_dive(deep_dive, scope, nsys_time_by_base=nsys_times)
+            no_traffic.append(phase.label)
         analysis.phases[scope] = phase
         analysis.warnings.extend(
             w for w in hierarchy.warnings if w not in analysis.warnings
+        )
+
+    # Phases nsys saw but ncu did not cover at all (ncu skipped, or a scope with no tier-2
+    # result). They still carry nsys timing and sampled L2 traffic.
+    if analysis.nsys:
+        for nvtx_phase, scope in PHASE_TO_SCOPE.items():
+            if scope in analysis.phases or not analysis.nsys.kernels_in_phase(nvtx_phase):
+                continue
+            phase = PhaseAnalysis(
+                scope=scope, hierarchy=HierarchySummary(scope=scope), traffic_collected=False,
+            )
+            analysis.phases[scope] = phase
+            no_traffic.append(phase.label)
+
+    if no_traffic:
+        analysis.warnings.append(
+            "ncu tier 1 was not collected for " + ", ".join(no_traffic) + ", so this run has "
+            "no per-level byte totals or hit rates for it. Where nsys sampled L2 traffic, the "
+            "decode physics check uses that instead: an upper bound on DRAM bytes, 6-10% high "
+            "on Qwen3-0.6B decode and ~1.9x on prefill. Add tier 1 back (ncu.tiers: [1, 2] or "
+            "--tiers 1,2) for exact DRAM bytes."
         )
 
     if not analysis.phases:
@@ -728,6 +780,7 @@ def _cross_check(analysis: RunAnalysis) -> None:
             phase.nsys_kernel_time_ns = sum(k.duration_ns for k in kernels)
             phase.nsys_instances = instances.get(nvtx_phase, 0)
             phase.occupancy = analysis.nsys.phase_occupancy(nvtx_phase)
+            phase.nsys_l2_bytes = analysis.nsys.sampled_l2_bytes_per_instance(nvtx_phase)
 
             # A phase that spends a large share of its wall time with an idle GPU is not
             # described by any bandwidth or compute figure, and every such figure in this
@@ -758,7 +811,10 @@ def _cross_check(analysis: RunAnalysis) -> None:
     # The physics check: a decode step must read the weights plus the KV cache. Skipped when
     # the collection was truncated, since the comparison would only measure the truncation.
     decode = analysis.phases.get("decode_step")
-    if decode and decode.truncated:
+    use_nsys_l2 = bool(decode and not decode.traffic_collected and decode.nsys_l2_bytes)
+    if decode and not decode.traffic_collected and not use_nsys_l2:
+        pass  # Already reported by _load_phases: no tier 1 and no sampled L2 to check against.
+    elif decode and decode.truncated:
         analysis.warnings.append(
             "Skipping the expected-versus-measured decode check: the collection was "
             "truncated, so the comparison would report the launch cap rather than the model."
@@ -800,7 +856,8 @@ def _cross_check(analysis: RunAnalysis) -> None:
         # scoping alarm. The expectation is the routed-active subset, taken from the same
         # place discovery took it: the checkpoint's own tensors, classified by role, where
         # those are known. Attention, shared experts, dense layers, routers and the LM head
-        # are read in full; routed experts at top_k/num_experts; input-embedding gathers and
+        # are read in full; routed experts at the fraction of experts the step's batch touches
+        # under the workload's routing (top_k/num_experts at batch 1); input-embedding gathers and
         # vision/audio towers not at all. (This previously scaled everything but the
         # embedding by the expert ratio -- attention included -- which disagreed with
         # ModelConfig.active_weight_bytes and understated Kimi-Linear's expectation by ~30%.)
@@ -808,8 +865,11 @@ def _cross_check(analysis: RunAnalysis) -> None:
         activation = model.expert_activation_ratio
         if activation is not None:
             total_weight_bytes = weight_bytes
-            weight_bytes, how = model.decode_read_weight_bytes()
-            source = f"{how} (routed-active)"
+            wl = analysis.workload
+            batch = wl.batch_size if wl else 1
+            routing = getattr(wl, "routing", "natural") if wl else "natural"
+            weight_bytes, how = model.decode_read_weight_bytes(batch, routing)
+            source = f"{how} (routed-active, batch {batch}, {routing} routing)"
 
         # A linear-attention layer's recurrent state is read *and rewritten in full* on every
         # step -- unlike a KV cache, which only appends one token. The measured cache size
@@ -825,6 +885,8 @@ def _cross_check(analysis: RunAnalysis) -> None:
             total_weight_bytes=total_weight_bytes,
             expert_activation_ratio=activation,
             state_write_bytes=state_write_bytes,
+            **({"measured_bytes": decode.nsys_l2_bytes, "measured_source": "nsys_l2"}
+               if use_nsys_l2 else {}),
         )
 
     # For MLA, what transformers caches (expanded per-head K/V) is not what MLA is designed

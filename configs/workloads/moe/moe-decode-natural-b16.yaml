@@ -1,0 +1,14 @@
+# MoE decode sweep: routing=natural -- the model's own router chooses the experts.
+# Routing is applied by nsight_bench/compat/routing.py; see docs/07-moe-routing.md.
+name: moe-decode-natural-b16
+kind: text-generation
+prompt_tokens: 128
+generate_tokens: 32
+batch_size: 16
+warmup_iters: 3
+repeat: 5
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false
+routing: natural

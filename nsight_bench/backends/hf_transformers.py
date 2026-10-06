@@ -66,6 +66,8 @@ class HFTransformersBackend(Backend):
         self._fp8_optimized: bool = False
         #: Decoding-state bytes by kind, from the most recent measurement.
         self._cache_breakdown: dict[str, int] = {}
+        #: Forced or observed MoE routing; None for natural routing on a profiled run.
+        self._routing: compat.RoutingController | None = None
 
     # ---- lifecycle --------------------------------------------------------------------
 
@@ -142,6 +144,13 @@ class HFTransformersBackend(Backend):
             self._attn_impl_replaced = compat.use_sdpa_if_flash_attn_missing(self.model)
         self._model_owns_cache = compat.model_manages_own_cache(self.model)
 
+        # Forced routing applies in every mode -- it is what is being measured. Observation
+        # is baseline-only: its bookkeeping kernels would otherwise land in the profiles.
+        self._routing = compat.install_routing(
+            self.model, self.workload_config.routing,
+            observe=self.profile_mode == "baseline",
+        )
+
         self._attn_impl_used = getattr(self.model.config, "_attn_implementation", "") or ""
         param = next(self.model.parameters(), None)
         self._dtype_used = str(param.dtype).replace("torch.", "") if param is not None else ""
@@ -151,6 +160,9 @@ class HFTransformersBackend(Backend):
     def teardown(self) -> None:
         import torch
 
+        if self._routing is not None:
+            self._routing.remove()
+            self._routing = None
         self.model = None
         self.tokenizer = None
         if torch.cuda.is_available():
@@ -255,6 +267,8 @@ class HFTransformersBackend(Backend):
     def prefill(self, inputs: Any) -> GenerationState:
         import torch
 
+        if self._routing is not None:
+            self._routing.phase = "prefill"
         cache = self._new_cache()
         kwargs: dict[str, Any] = {}
         keyword = self._resolve_logits_to_keep()
@@ -309,6 +323,8 @@ class HFTransformersBackend(Backend):
         """
         import torch
 
+        if self._routing is not None:
+            self._routing.phase = "decode"
         with torch.inference_mode():
             outputs = self.model(
                 input_ids=state.last_token_ids,
@@ -414,6 +430,16 @@ class HFTransformersBackend(Backend):
                 "import_shims": self._compat_shims,
                 "cache_classes_adapted": self._compat_cache_classes,
             }
+        if self.workload_config.routing != "natural" or self._routing is not None:
+            info["routing"] = (
+                self._routing.summary() if self._routing is not None
+                else {"mode": self.workload_config.routing, "gates_hooked": 0}
+            )
+            if self.workload_config.routing != "natural":
+                info["routing_warning"] = (
+                    f"MoE routing was forced ({self.workload_config.routing}): the generated "
+                    "text is meaningless; only the memory traffic is representative"
+                )
         if self._attn_impl_replaced:
             info["attn_warning"] = (
                 f"the model forces {self._attn_impl_replaced}, which is not installed; its "

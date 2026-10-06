@@ -1,4 +1,6 @@
-# Standard: the default. Tier 1 over every kernel in scope, full sections on the heaviest few.
+# Standard: the default. Full sections on the heaviest few kernels, ranked from the nsys
+# timeline. Tier 1 (the per-level byte totals and the decode physics check) is off because it
+# takes hours on an eager MoE; set tiers: [1, 2] or pass --tiers 1,2 to turn it back on.
 baseline: true
 nsys:
   enabled: true
@@ -14,7 +16,8 @@ nsys:
   timeout_s: 3600
 ncu:
   enabled: true
-  tiers: [1, 2]
+  tiers: [2]            # [1, 2] = tier 1 back on
+  rank_source: nsys     # or tier1: rank from tier 1's own export (needs 1 in tiers)
   top_n_kernels: 8
   nvtx_scope: nsbench.decode_step
   clock_control: base

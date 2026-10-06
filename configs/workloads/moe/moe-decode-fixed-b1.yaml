@@ -1,0 +1,14 @@
+# MoE decode sweep: routing=fixed -- every token forced to experts 0-7 in every layer (best case, fewest bytes).
+# Routing is applied by nsight_bench/compat/routing.py; see docs/07-moe-routing.md.
+name: moe-decode-fixed-b1
+kind: text-generation
+prompt_tokens: 128
+generate_tokens: 32
+batch_size: 1
+warmup_iters: 3
+repeat: 5
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false
+routing: fixed

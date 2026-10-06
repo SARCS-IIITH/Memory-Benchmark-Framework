@@ -482,6 +482,11 @@ class DecodeExpectation:
     #: already in ``kv_bytes``). Zero for models without linear-attention layers.
     state_write_bytes: int = 0
 
+    #: Where ``measured_bytes`` came from: "ncu" (tier 1's DRAM bytes for one profiled step)
+    #: or "nsys_l2" (L2 traffic sampled by nsys, averaged over every step). nsys L2 is an
+    #: upper bound on DRAM traffic; on Qwen3-0.6B decode it read 6-10% above ncu's DRAM.
+    measured_source: str = "ncu"
+
     @property
     def is_moe(self) -> bool:
         return bool(self.expert_activation_ratio is not None and self.total_weight_bytes)
@@ -497,6 +502,16 @@ class DecodeExpectation:
         return self.measured_bytes / self.expected_bytes
 
     def verdict(self) -> str:
+        verdict = self._verdict()
+        if self.measured_source == "nsys_l2" and self.ratio is not None:
+            verdict += (
+                " Measured here is L2 traffic sampled by nsys, not DRAM bytes (ncu tier 1 was "
+                "off). It is an upper bound on DRAM traffic. On Qwen3-0.6B decode it ran 6-10% "
+                "above ncu's DRAM figure, so read this ratio as slightly high."
+            )
+        return verdict
+
+    def _verdict(self) -> str:
         ratio = self.ratio
         if ratio is None:
             return "not evaluated (no measured DRAM traffic)"
@@ -542,6 +557,7 @@ class DecodeExpectation:
             "state_write_bytes": self.state_write_bytes or None,
             "expected_bytes": self.expected_bytes,
             "measured_bytes": self.measured_bytes,
+            "measured_source": self.measured_source,
             "ratio": self.ratio,
             "ratio_vs_total_weights": (
                 self.measured_bytes / self.total_weight_bytes
@@ -561,11 +577,16 @@ def check_decode_expectation(
     total_weight_bytes: int = 0,
     expert_activation_ratio: float | None = None,
     state_write_bytes: int = 0,
+    measured_bytes: float | None = None,
+    measured_source: str = "ncu",
 ) -> DecodeExpectation:
+    """Build the expectation. ``measured_bytes`` overrides the summary's DRAM bytes, for when
+    the measurement comes from somewhere else (``measured_source``)."""
     return DecodeExpectation(
         weight_bytes=weight_bytes,
         kv_bytes=kv_bytes,
-        measured_bytes=summary.dram_bytes,
+        measured_bytes=summary.dram_bytes if measured_bytes is None else measured_bytes,
+        measured_source=measured_source,
         context_len=context_len,
         weight_bytes_source=weight_bytes_source,
         total_weight_bytes=total_weight_bytes,

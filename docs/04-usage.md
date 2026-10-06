@@ -71,9 +71,15 @@ To see how one model behaves as the prompt grows and the KV cache with it:
 
 | Profile | ncu tiers | What it is for |
 |---|---|---|
-| `configs/profiles/quick.yaml` | 1 | Iterating on setup; checking a checkpoint loads and profiles. |
-| `configs/profiles/standard.yaml` | 1, 2 | The default. Full memory metrics plus section deep-dive on the heaviest kernels. |
-| `configs/profiles/deep.yaml` | 1, 2, 3 | Adds source-level attribution. Slow, and only useful with SASS line info. |
+| `configs/profiles/quick.yaml` | 2 | Iterating on setup; checking a checkpoint loads and profiles. Deep dive on the top 5 kernels. |
+| `configs/profiles/standard.yaml` | 2 | The default. Section deep-dive on the heaviest 8 kernels, ranked from the nsys timeline. |
+| `configs/profiles/deep.yaml` | 2, 3 | Adds source-level attribution. Slow, and only useful with SASS line info. |
+
+Tier 1 (the per-level byte totals, hit rates and decode physics check) is **off in every
+profile**, because on an eager MoE it takes hours per phase. Turn it back on per run with
+`--tiers 1,2`, or in a profile with `tiers: [1, 2]`. Tier 2's kernel ranking comes from the
+nsys timeline; `--rank-source tier1` (or `rank_source: tier1`) ranks from tier 1's export
+instead, which needs tier 1 on.
 
 ## Choosing a workload
 
@@ -95,15 +101,17 @@ nsbench run --model configs/models/x.yaml \
 
 ## Cost, and the knob that controls it
 
-Nsight Compute replays every kernel, so tier 1 costs roughly **one minute per 100 kernels in
-scope**. An eager transformers decode step runs far more kernels than the layer count
+Nsight Compute replays every kernel, so tier 1, when it is turned on, costs roughly **one
+minute per 100 kernels in scope**. An eager transformers decode step runs far more kernels than the layer count
 suggests -- about 55-60 launches per transformer block -- so a 28-layer model is around 1600
 launches, or ~16 minutes per phase.
 
 ```bash
 nsbench run --model ... --max-kernels 8000     # raise the cap for a large model
 nsbench run --model ... --skip-ncu             # timeline and timing only, minutes not hours
+nsbench run --model ... --tiers 1,2            # add tier 1 back: byte totals + physics check
 nsbench run --model ... --tiers 1 --top-n 4    # tier 1 only, fewer deep dives
+nsbench run --model ... --rank-source tier1    # rank tier 2 from tier 1 (needs --tiers 1,2)
 ```
 
 `--max-kernels` is a runaway guard, not a sampling knob: below the real kernel count it
@@ -132,7 +140,7 @@ For the interactive views:
 
 ```bash
 nsys-ui  runs/<id>/raw/timeline.nsys-rep
-ncu-ui   runs/<id>/raw/ncu_tier1_decode_step.ncu-rep
+ncu-ui   runs/<id>/raw/ncu_tier2_decode_step.ncu-rep   # ncu_tier1_* too, if tier 1 was on
 ```
 
 To re-render reports after changing the report code, without re-profiling:
@@ -369,8 +377,10 @@ Two traps:
 - **The cache layout follows the `transformers` implementation, not production serving.** For
   multi-head latent attention models (DeepSeek-V3, Kimi K2), serving engines cache the
   compressed latent vector. The HF modelling code decompresses it and caches full per-head K and
-  V, which is tens of times larger per token. Decode KV traffic measured here describes the HF
-  reference execution.
+  V, which is many times larger per token: **18× on Kimi-Linear-48B** (measured 143.4 KB per
+  token per sequence across its 7 MLA layers, against an 8.06 KB latent; docs/07 section 5.3).
+  The exact factor depends on head count and dimensions. Decode KV traffic measured here
+  describes the HF reference execution.
 
 What a correct quantized run looks like:
 
@@ -453,15 +463,16 @@ nsbench run --model configs/models/my-model.yaml \
             --profile configs/profiles/quick.yaml --skip-ncu --no-sweep
 
 # 4. Open runs/<id>/report.html. All stages "ok", and the calibration gate passed?
-#    Then add ncu tier 1:
+#    Then add ncu (quick profile: tier-2 deep dive on the top 5 kernels):
 nsbench run --model configs/models/my-model.yaml \
             --workload configs/workloads/decode-focused.yaml \
             --profile configs/profiles/quick.yaml
 
-# 5. The real measurement
+# 5. The real measurement. --tiers 1,2 adds the byte totals and physics check; on a
+#    dense model that is about a minute per 100 kernels, on an eager MoE many hours.
 nsbench run --model configs/models/my-model.yaml \
             --workload configs/workloads/decode-focused.yaml \
-            --profile configs/profiles/standard.yaml --tag full
+            --profile configs/profiles/standard.yaml --tiers 1,2 --tag full
 
 # 6. Optional: the same model across prompt lengths, or against other models
 ./scripts/run_bench.sh /path/to/checkpoint my-model
@@ -477,6 +488,8 @@ When reading the report:
 - Start with the trust section (calibration gate and sentinels). If that failed, nothing below it
   holds. [01-platform-gb10.md](01-platform-gb10.md) explains why the gate exists.
 - Then read the decode physics check, which compares measured traffic against predicted traffic.
+  It only exists when tier 1 ran; otherwise the report says so and the byte figures read "not
+  measured".
 - Then read the hierarchy. [02-metric-reference.md](02-metric-reference.md) says what each number
   is, and [03-methodology.md](03-methodology.md) says what it does and does not mean.
 

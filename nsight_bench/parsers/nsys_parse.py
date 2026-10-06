@@ -24,6 +24,13 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
+
+#: The sampled all-L2-traffic series added by configs/nsys/gb20b_l2.config.
+L2_SECTORS_METRIC = "L2 Sectors [Sectors]"
+L2_SECTOR_BYTES = 32
+#: Kernels of one phase closer together than this count as one GPU-busy window.
+L2_WINDOW_MERGE_NS = 1_000_000
 
 #: NVTX event types in the nsys schema.
 NVTX_PUSH_POP_RANGE = 59
@@ -198,21 +205,70 @@ class NsysReport:
             "gpu_busy_ns_per_instance": busy_ns / len(windows),
         }
 
-    def kernel_time_by_name(self, phase: str | None = None) -> dict[str, tuple[int, int]]:
-        """``kernel name -> (total ns, launch count)``, optionally scoped to a phase."""
+    def kernel_time_by_name(
+        self, phase: str | None = None, key: Callable[[str], str] | None = None,
+    ) -> dict[str, tuple[int, int]]:
+        """``kernel name -> (total ns, launch count)``, optionally scoped to a phase.
+
+        ``key`` maps each demangled name to the name it is grouped under. Pass
+        :func:`~nsight_bench.parsers.ncu_parse.base_identifier` to group the way ncu's
+        ``--kernel-name`` filter matches, so every template instantiation of one function
+        counts toward a single entry.
+        """
         totals: dict[str, tuple[int, int]] = {}
         for kernel in self.kernels:
             if phase is not None and kernel.phase != phase:
                 continue
-            total, count = totals.get(kernel.name, (0, 0))
-            totals[kernel.name] = (total + kernel.duration_ns, count + 1)
+            name = key(kernel.name) if key else kernel.name
+            if not name:
+                continue
+            total, count = totals.get(name, (0, 0))
+            totals[name] = (total + kernel.duration_ns, count + 1)
         return totals
 
-    def top_kernels(self, phase: str | None = None, n: int = 10) -> list[tuple[str, int, int]]:
+    def sampled_l2_bytes_per_instance(self, phase: str) -> float | None:
+        """L2 traffic per instance of ``phase``, from the sampled ``lts__t_sectors`` series.
+
+        Only present when the extended metric set ran (``nsys.sample_l2_traffic``). The phase's
+        kernels are merged into GPU-busy windows (gaps under :data:`L2_WINDOW_MERGE_NS`
+        joined), and every sample whose interval ends inside a window, or within one sampling
+        period after it, is counted. A sample is the counter delta over the interval ending at
+        its timestamp. Validated against ncu on Qwen3-0.6B: within 1% for prefill and 4% for
+        decode.
+        """
+        samples = self.gpu_metrics.get(L2_SECTORS_METRIC)
+        kernels = self.kernels_in_phase(phase)
+        instances = self.phase_instance_counts().get(phase, 0)
+        if not samples or not kernels or not instances:
+            return None
+        times = [t for t, _ in samples]
+        prefix = [0.0]
+        for _, value in samples:
+            prefix.append(prefix[-1] + value)
+        period = (times[-1] - times[0]) / max(1, len(times) - 1)
+
+        windows: list[list[int]] = []
+        for start, end in sorted((k.start_ns, k.end_ns) for k in kernels):
+            if windows and start - windows[-1][1] <= L2_WINDOW_MERGE_NS:
+                windows[-1][1] = max(windows[-1][1], end)
+            else:
+                windows.append([start, end])
+
+        sectors = 0.0
+        for start, end in windows:
+            lo = bisect.bisect_right(times, start)
+            hi = bisect.bisect_right(times, end + period)
+            sectors += prefix[hi] - prefix[lo]
+        return sectors * L2_SECTOR_BYTES / instances
+
+    def top_kernels(
+        self, phase: str | None = None, n: int = 10,
+        key: Callable[[str], str] | None = None,
+    ) -> list[tuple[str, int, int]]:
         """Kernels ranked by total GPU time: ``(name, total_ns, launches)``."""
         ranked = sorted(
             ((name, total, count)
-             for name, (total, count) in self.kernel_time_by_name(phase).items()),
+             for name, (total, count) in self.kernel_time_by_name(phase, key).items()),
             key=lambda item: item[1], reverse=True,
         )
         return ranked[:n]

@@ -52,7 +52,8 @@ zero. The gate result is stamped into every run and every report.
 - **Footprint from three independent sources**, because NVML reports nothing on this part.
 - **A physics check.** A decode step must read every weight and the whole KV cache to produce
   one token, so its traffic is predictable. Measured against predicted is the strongest
-  available test that the scoping and the derivation are both right.
+  available test that the scoping and the derivation are both right. It needs ncu tier 1,
+  which is off by default (`--tiers 1,2`).
 
 ## Layout
 
@@ -86,11 +87,13 @@ runs/           output, one directory per run
 | [docs/02-metric-reference.md](docs/02-metric-reference.md) | Every metric collected, what it means, and how the reported quantities are derived |
 | [docs/03-methodology.md](docs/03-methodology.md) | How to read the numbers, and what the harness deliberately does not claim |
 | [docs/04-usage.md](docs/04-usage.md) | Commands, cost, output layout, troubleshooting |
+| [docs/08-nsys-l2-sampling.md](docs/08-nsys-l2-sampling.md) | Per-phase memory traffic from nsys L2 sampling instead of ncu tier 1: why, validation on Qwen, caveats |
 
 ## Cost
 
-Nsight Compute replays every kernel, so tier 1 runs at roughly **one minute per 100 kernels in
-scope**. An eager transformers decode step is around 55-60 kernel launches per transformer
+Nsight Compute tier 1 is **off by default**: it runs at roughly **one minute per 100 kernels
+in scope**, which is hours on an eager MoE. Tier 2 ranks its kernels from the nsys timeline
+instead. `--tiers 1,2` turns tier 1 back on when the byte totals are needed. An eager transformers decode step is around 55-60 kernel launches per transformer
 block, so a 28-layer model is ~1600 launches, or ~16 minutes per phase. `--skip-ncu` gives
 the timeline and honest timing in minutes instead.
 

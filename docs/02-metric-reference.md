@@ -166,9 +166,20 @@ memory-chart edges) are section-internal and cannot be requested individually:
 `MemoryWorkloadAnalysis_Chart`, `ComputeWorkloadAnalysis`, `LaunchStats`, `Occupancy`,
 `SchedulerStats`, `WarpStateStats`, `InstructionStats`, `WorkloadDistribution`.
 
-Tier 2 picks its kernels from **tier 1's own export**, not from the nsys timeline. The two
-tools demangle differently -- nsys reports a full templated signature where ncu reports a
-base function name -- so a regex built from one will not reliably match the other.
+Tier 2 picks its kernels from **the nsys timeline** by default (`ncu.rank_source: nsys`):
+per-kernel GPU time inside the phase's NVTX range, summed over every instance of the phase.
+The two tools demangle differently -- nsys reports a full templated signature where ncu reports
+a base function name -- so nsys names are first reduced to the same base identifier ncu's
+`--kernel-name` filter matches (`base_identifier()`), and the ranking is by that base name.
+`rank_source: tier1` restores the original behaviour of ranking from tier 1's own export. Each
+source falls back to the other when it has nothing for a phase.
+
+**Tier 1 is off by default** (`ncu.tiers: [2]`). Over every kernel in scope it needs about 15
+replay passes per launch. On an eager MoE that is hours per phase: Kimi-Linear runs ~12,000
+launches per decode step and ~190,000 per prefill, so it also ends truncated at the launch cap.
+Without tier 1 the run has no per-level byte totals, hit rates or decode physics check; the
+report marks those "not measured" and says why. Turn it back on with `tiers: [1, 2]` or
+`--tiers 1,2`.
 
 Note: `MemoryWorkloadAnalysis` requests `dram__bytes.sum.per_second`, which does not exist
 here, so those rows come back `n/a`. The parser tolerates this rather than failing.

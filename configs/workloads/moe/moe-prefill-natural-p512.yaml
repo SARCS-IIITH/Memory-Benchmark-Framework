@@ -1,0 +1,14 @@
+# MoE short prefill: routing=natural -- the model's own router chooses the experts.
+# Routing is applied by nsight_bench/compat/routing.py; see docs/07-moe-routing.md.
+name: moe-prefill-natural-p512
+kind: text-generation
+prompt_tokens: 512
+generate_tokens: 4
+batch_size: 1
+warmup_iters: 2
+repeat: 3
+prompt_source: synthetic
+do_sample: false
+seed: 1234
+annotate_layers: false
+routing: natural

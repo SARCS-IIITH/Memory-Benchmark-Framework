@@ -550,9 +550,15 @@ profiled* above, and **tiering**, which is new to this document.
     for transformer GEMMs) plus non-tensor fp32/fp16 FMA instruction counts. This is what lets a
     kernel be placed on the roofline against calibration's measured ceilings, since arithmetic
     intensity needs a real FLOP count rather than one inferred from parameter counts.
-- **Tier 2 and above** deep-dive only the top-N kernels tier 1 showed actually matter, ranked by
-  tier 1's own measured time from tier 1's CSV export -- not nsys's timeline, because nsys and ncu
-  demangle kernel names differently and would disagree on granularity. Rather than an individual
+- **Tier 1 is optional and off by default** (`ncu.tiers: [2]`). It is the only source of the
+  byte totals and the decode physics check, but on an eager MoE it costs hours per phase and
+  still truncates at the launch cap. Add it back with `tiers: [1, 2]` or `--tiers 1,2`.
+- **Tier 2 and above** deep-dive only the top-N kernels that actually matter. By default they
+  are ranked from the nsys timeline (`ncu.rank_source: nsys`): GPU time per kernel, attributed
+  to the phase through the NVTX range that launched it, summed over every instance. nsys and
+  ncu demangle kernel names differently, so both are reduced to the bare function identifier
+  ncu's `--kernel-name` filter matches before ranking. `rank_source: tier1` ranks from tier 1's
+  own CSV export instead, as before. Rather than an individual
   metric list, tier 2 requests whole Nsight Compute *sections*, because some of the quantities
   that matter here (register-spill request counts, for instance) are section-internal and fail as
   standalone `--metrics` entries.
@@ -578,6 +584,13 @@ it's sized as the larger of 48 or twelve times the number of top-N kernels being
 it is **deliberate sampling, not truncation** -- tier-2 metrics are read per kernel and never
 summed into a phase total the way tier 1's byte counts are, so sampling a subset of launches costs
 nothing that truncating tier 1 would.
+
+The sample is launch-ordered, though: it takes the first matching launches. When elementwise
+kernels launch far more often than GEMMs, they fill most of the cap. In the 2026-10-06 smoke
+test, 54 of the 60 prefill launches were elementwise, and nsys's #3 kernel was never sampled.
+On Kimi's prefill (~125k elementwise against ~16k GEMM launches) the cap is likely to fill from
+the first layer or two. Time-weighting corrects shares among the kernels that were sampled, but
+not for a kernel that is missing; the report's sample-coverage note says when that happened.
 
 ### The stall-reason vocabulary, and how it becomes a verdict
 
@@ -606,8 +619,9 @@ attributable to each of 15 named reasons a warp wasn't able to issue an instruct
 **Correcting for sampling bias.** Tier 2 only profiles a capped, launch-ordered sample of
 kernels, which over-represents whichever kernels happened to launch earliest or most often. To
 avoid reporting a distribution skewed by that sampling order, stall shares are time-weighted using
-tier 1's *complete* per-kernel duration -- tier 1 ran over every kernel in scope, cheaply --
-rather than tier 2's own biased sample count. The result is a phase-wide stall-reason distribution
+tier 1's *complete* per-kernel duration when tier 1 ran, or otherwise the nsys timeline's, rather
+than tier 2's own biased sample count. nsys times are per base identifier, so each sampled
+template instantiation gets a share of its base name's time in proportion to its sampled time. The result is a phase-wide stall-reason distribution
 that reflects where the phase's time actually went, not which kernels happened to get
 deep-profiled.
 
@@ -648,6 +662,12 @@ per-kernel CSV shape as tier 1 -- there's no separate parsing path to maintain.
   For MLA layers, transformers caches expanded per-head K/V rather than the compressed latent,
   so the measured cache is that size. The report gives the latent an MLA-native engine would
   hold alongside it, as "MLA latent equivalent".
+
+  Measured on Kimi-Linear-48B (2026-10-06, 22 runs; docs/07 section 5.3):
+  - MLA K/V: 143.4 KB per token per sequence; latent: 8.06 KB (18× smaller).
+  - KDA recurrent + conv state: 41.9 + 2.0 MB per sequence, constant with context.
+  - So below ~292 tokens per sequence the fixed state is the larger part of the cache, and at
+    16k tokens the expanded MLA K/V is 98% of it (2.35 of 2.40 GB).
 - **Bandwidth at real latency.** ncu's DRAM bytes divided by *baseline's* wall time -- never ncu's
   own replay-inflated time -- checked against calibration's LPDDR5X ceiling as an upper bound.
   Exceeding that ceiling confirms the numerator reads high, for the reasons given in *Cache state

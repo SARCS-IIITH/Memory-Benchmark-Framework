@@ -1,0 +1,36 @@
+# MoE routing sweep (configs/workloads/moe/, scripts/run_moe_queue.sh).
+#
+# Bytes come from nsys: the L2-extended GPU-metric set samples all L2 traffic per phase at no
+# extra cost (sample_l2_traffic). For decode that is a usable, slightly high estimate of DRAM
+# traffic (+6-10% on Qwen3-0.6B); for prefill it overstates DRAM (~1.9x). ncu tier 1 is off: on
+# Kimi it is ~13 h per decode run. Tier 2 deep-dives the top 5 kernels, ranked from nsys, on the
+# runs the queue does not pass --skip-ncu to.
+#
+# Timeouts are longer than quick.yaml's: at batch 32 a decode step touches up to all 256
+# experts, and Kimi launches kernels per used expert, so each step is many times heavier than
+# at batch 1.
+baseline: true
+nsys:
+  enabled: true
+  trace: cuda,nvtx,osrt
+  cuda_memory_usage: true
+  cuda_um_cpu_page_faults: false
+  cuda_um_gpu_page_faults: false
+  gpu_metrics: true
+  gpu_metrics_frequency: 10000
+  sample_l2_traffic: true
+  cuda_graph_trace: node
+  capture_range: cudaProfilerApi
+  capture_range_end: stop
+  timeout_s: 7200
+ncu:
+  enabled: true
+  tiers: [2]
+  rank_source: nsys
+  top_n_kernels: 5
+  nvtx_scope: nsbench.decode_step
+  clock_control: base
+  cache_control: all
+  replay_mode: kernel
+  max_kernels: 4000
+  timeout_s: 7200

@@ -348,6 +348,25 @@ class ModelConfig:
             return None
         return min(1.0, self.num_experts_per_token / self.num_experts)
 
+    def routed_read_fraction(
+        self, tokens_per_pass: int = 1, routing: str = "natural"
+    ) -> float | None:
+        """Fraction of the routed expert weights one forward pass of ``tokens_per_pass`` reads.
+
+        Weights are read once per pass however many tokens share an expert, so what matters
+        is the number of *distinct* experts the pass touches -- see
+        :func:`nsight_bench.compat.routing.expected_distinct_experts`. At one token per pass
+        and natural routing this is exactly :attr:`routed_activation_ratio`.
+        """
+        if not self.is_moe:
+            return None
+        from .compat.routing import expected_distinct_experts
+
+        distinct = expected_distinct_experts(
+            routing, tokens_per_pass, self.num_experts, self.num_experts_per_token
+        )
+        return min(1.0, distinct / self.num_experts)
+
     def attention_bytes(self) -> int:
         """Bytes of attention projection weights across all layers.
 
@@ -392,13 +411,20 @@ class ModelConfig:
         layers = self.attention_layout()["full"] + self.attention_layout()["sliding"]
         return int((q + kv_a + kv_b + o) * layers * self.bits_per_weight / 8)
 
-    def decode_read_weight_bytes(self) -> tuple[int, str]:
-        """Weight bytes one batch-1 decode step must read, and how that figure was obtained.
+    def decode_read_weight_bytes(
+        self, batch_size: int = 1, routing: str = "natural"
+    ) -> tuple[int, str]:
+        """Weight bytes one decode step must read, and how that figure was obtained.
+
+        A decode step is one pass of ``batch_size`` tokens, so routed experts are scaled by
+        :meth:`routed_read_fraction` for that many tokens under ``routing``. The defaults give
+        the batch-1, natural-routing figure.
 
         From the checkpoint's own tensors when discovery classified them
         (:attr:`weight_bytes_by_role`), which is exact for any architecture:
 
-        * routed experts at ``top_k / num_experts`` of their stored size;
+        * routed experts at the fraction of experts the pass touches (``top_k /
+          num_experts`` at batch 1);
         * the input embedding excluded -- a step gathers one row per token, not the matrix;
         * vision and audio towers excluded -- a text decode step never touches them;
         * everything else in full: attention of whatever kind, shared experts, dense
@@ -416,7 +442,7 @@ class ModelConfig:
         read = (sum(roles.values()) - roles.get("multimodal", 0) - embedding - routed)
         if not lm_head and self.tie_word_embeddings:
             read += embedding
-        ratio = self.routed_activation_ratio
+        ratio = self.routed_read_fraction(batch_size, routing)
         read += int(routed * ratio) if ratio is not None else routed
         return int(read), "checkpoint tensors by role"
 
@@ -1117,10 +1143,22 @@ class WorkloadConfig:
     #: for timing runs and on for attribution runs.
     annotate_layers: bool = False
 
+    #: Mixture-of-experts routing: "natural" (the model's router), "fixed" (every token to
+    #: experts 0..k-1, the lower bound on expert traffic) or "disjoint" (no two tokens of a
+    #: pass share an expert, the upper bound). Forced modes make the generated text
+    #: meaningless but leave the weight traffic real -- see nsight_bench/compat/routing.py.
+    routing: str = "natural"
+
     #: Multimodal placeholders, honoured by the multimodal workload when it is implemented.
     image_count: int = 0
     image_size: tuple[int, int] = (448, 448)
     audio_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.routing not in ("natural", "fixed", "disjoint"):
+            raise ValueError(
+                f"workload routing must be natural, fixed or disjoint, got {self.routing!r}"
+            )
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1157,6 +1195,14 @@ class NsysConfig:
     gpu_metrics: bool = True
     gpu_metrics_frequency: int = 10_000
 
+    #: Also sample all L2 traffic (``lts__t_sectors``), using the extended metric set in
+    #: ``configs/nsys/`` when one exists for this chip (GB10: ``gb20b_l2.config``). This
+    #: gives per-phase L2 bytes at no extra cost, without ncu. On Qwen3-0.6B, decode L2
+    #: traffic came out 6-10% above ncu's DRAM bytes, so for decode it is a usable,
+    #: slightly high estimate of memory traffic. Prefill reuses activations in L2, so there
+    #: it was ~1.9x DRAM. Set false to use the stock set.
+    sample_l2_traffic: bool = True
+
     #: "node" resolves kernels inside CUDA graphs individually instead of collapsing a whole
     #: graph launch into one opaque entry.
     cuda_graph_trace: str = "node"
@@ -1177,12 +1223,27 @@ class NcuConfig:
 
     enabled: bool = True
 
-    #: 1 = curated memory metric list over every kernel in one decode step.
+    #: 1 = curated memory metric list over every kernel in scope. This is the only source of
+    #:     the per-level byte totals, hit rates and the decode physics check.
     #: 2 = full sections on the heaviest kernels.
     #: 3 = adds source-level attribution.
-    tiers: tuple[int, ...] = (1, 2)
+    #:
+    #: Tier 1 is off by default. It replays every launch in scope about 15 times, which is
+    #: tolerable for a dense model (~1,600 launches per decode step) but not for an eager MoE
+    #: (Kimi-Linear: ~12,000 per decode step and ~190,000 per prefill, i.e. many hours that
+    #: still end truncated at the launch cap). Add 1 back (``tiers: [1, 2]`` or
+    #: ``--tiers 1,2``) whenever the byte totals are wanted.
+    tiers: tuple[int, ...] = (2,)
 
-    #: How many kernels tier 2 deep-dives, ranked by measured time from the nsys pass.
+    #: Where tier 2+ gets its top-N kernel list: "nsys" (GPU time per kernel from the nsys
+    #: timeline, attributed to the phase through the launching NVTX range) or "tier1" (tier
+    #: 1's own ncu export, the original behaviour). Whichever is chosen, the other is used as
+    #: a fallback when the preferred source has no data for a phase. nsys ranking costs
+    #: nothing extra and covers every instance of the phase at real clocks; tier-1 ranking
+    #: only sees the launches that fit under the launch cap.
+    rank_source: str = "nsys"
+
+    #: How many kernels tier 2 deep-dives, ranked by GPU time (see :attr:`rank_source`).
     top_n_kernels: int = 8
 
     #: NVTX range that scopes collection. One decode step yields one instance of each unique
@@ -1226,6 +1287,13 @@ class NcuConfig:
     auto_launch_cap: bool = True
 
     timeout_s: int = 7200
+
+    def __post_init__(self) -> None:
+        self.tiers = tuple(int(t) for t in self.tiers)
+        if self.rank_source not in ("nsys", "tier1"):
+            raise ValueError(
+                f"ncu rank_source must be nsys or tier1, got {self.rank_source!r}"
+            )
 
 
 @dataclass

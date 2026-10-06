@@ -70,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
 
         backend_cls = get_backend(run_config.backend)
         backend = backend_cls(run_config.model, run_config.workload)
+        backend.profile_mode = mode.value
 
         # Weight loading is a phase in its own right: on a unified-memory part it is the
         # largest single memory event in the run, and its cost is pure host-to-device

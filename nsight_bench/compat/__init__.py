@@ -7,6 +7,7 @@ silently undone by the next fetch -- the gaps are bridged here, at runtime, and 
 adapter that fires is recorded in the run manifest.
 """
 
+from .routing import ROUTING_MODES, RoutingController, install_routing
 from .transformers_compat import (
     adapt_model_cache_api,
     apply_remote_code_shims,
@@ -16,6 +17,9 @@ from .transformers_compat import (
 )
 
 __all__ = [
+    "ROUTING_MODES",
+    "RoutingController",
+    "install_routing",
     "adapt_model_cache_api",
     "apply_remote_code_shims",
     "is_fp8_compressed_tensors",

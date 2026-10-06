@@ -267,6 +267,8 @@ def _build_run_config(args: argparse.Namespace) -> RunConfig:
         profile_config.ncu.auto_launch_cap = False
     if args.tiers:
         profile_config.ncu.tiers = tuple(int(t) for t in args.tiers.split(","))
+    if args.rank_source:
+        profile_config.ncu.rank_source = args.rank_source
 
     return RunConfig(
         model=model,
@@ -289,8 +291,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"  workload   {run_config.workload.prompt_tokens} prompt tokens -> "
           f"{run_config.workload.generate_tokens} generated, "
           f"batch {run_config.workload.batch_size}")
-    print(f"  ncu tiers  {list(run_config.profile.ncu.tiers)}  "
-          f"(top {run_config.profile.ncu.top_n_kernels} kernels deep-dived)")
+    ncu_cfg = run_config.profile.ncu
+    print(f"  ncu tiers  {list(ncu_cfg.tiers)}  "
+          f"(top {ncu_cfg.top_n_kernels} kernels deep-dived, ranked from "
+          f"{'nsys' if ncu_cfg.rank_source == 'nsys' else 'tier 1'})")
+    if 1 not in ncu_cfg.tiers:
+        print("             tier 1 off: no byte totals or decode physics check "
+              "(--tiers 1,2 to add it)")
     print()
 
     record = BenchmarkOrchestrator(
@@ -578,7 +585,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype")
     p.add_argument("--attn")
     p.add_argument("--profile", help="Profiler config YAML")
-    p.add_argument("--tiers", help="Comma-separated ncu tiers, e.g. '1,2'")
+    p.add_argument("--tiers", help="Comma-separated ncu tiers, e.g. '2' (default) or '1,2' "
+                                   "to add tier 1's byte totals and physics check")
+    p.add_argument("--rank-source", choices=("nsys", "tier1"),
+                   help="Where tier 2 gets its top-N kernels: the nsys timeline (default) or "
+                        "tier 1's ncu export. Falls back to the other when it has no data")
     p.add_argument("--top-n", type=int, help="Kernels to deep-dive in tier 2")
     p.add_argument("--max-kernels", type=int,
                    help="ncu --launch-count cap. Below the phase's real kernel count this "

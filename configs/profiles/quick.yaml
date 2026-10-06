@@ -1,7 +1,10 @@
-# Quick: tier 1 only, no deep dive, no calibration sweep.
+# Quick: a small tier-2 deep dive (top 5 kernels, ranked from the nsys timeline), no
+# calibration sweep.
 #
 # For iterating on a setup or checking that a new checkpoint loads and profiles at all.
-# Roughly one minute of ncu per 100 kernels in scope.
+# Tier 1 is off: it costs roughly one minute of ncu per 100 kernels in scope, which is hours
+# on an eager MoE. For a tier-1-only run, as this profile used to be, set tiers: [1] or pass
+# --tiers 1.
 baseline: true
 nsys:
   enabled: true
@@ -17,7 +20,8 @@ nsys:
   timeout_s: 1800
 ncu:
   enabled: true
-  tiers: [1]
+  tiers: [2]            # [1] = tier 1 only (byte totals, no deep dive)
+  rank_source: nsys     # or tier1: rank from tier 1's own export (needs 1 in tiers)
   top_n_kernels: 5
   nvtx_scope: nsbench.decode_step
   clock_control: base
