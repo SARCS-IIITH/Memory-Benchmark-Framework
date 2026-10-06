@@ -635,6 +635,19 @@ per-kernel CSV shape as tier 1 -- there's no separate parsing path to maintain.
   an analytic prediction: resident weight bytes plus KV-cache bytes, both **taken from baseline's
   own measurements**, not re-derived here. This check cannot run without baseline's numbers -- it
   validates ncu's measurement against baseline's, rather than ncu validating itself.
+  Two refinements apply to non-dense models:
+  - **Mixture of experts.** The weight term is the routed-active subset, sized from the
+    checkpoint's own tensors, which discovery classifies by role from the safetensors headers:
+    - routed experts at `top_k / num_experts` of their stored size;
+    - attention, shared experts, dense layers, routers, norms and the LM head in full;
+    - the input embedding (a one-row gather) and vision/audio towers not at all.
+  - **Linear attention** (Kimi's KDA, Gated DeltaNet, Mamba-2). The measured cache includes
+    the fixed-size recurrent state. The state is also rewritten in full every step, so its
+    size is added once more as a write.
+
+  For MLA layers, transformers caches expanded per-head K/V rather than the compressed latent,
+  so the measured cache is that size. The report gives the latent an MLA-native engine would
+  hold alongside it, as "MLA latent equivalent".
 - **Bandwidth at real latency.** ncu's DRAM bytes divided by *baseline's* wall time -- never ncu's
   own replay-inflated time -- checked against calibration's LPDDR5X ceiling as an upper bound.
   Exceeding that ceiling confirms the numerator reads high, for the reasons given in *Cache state

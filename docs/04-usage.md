@@ -3,16 +3,16 @@
 All commands assume the harness environment:
 
 ```bash
-source /home/sarcs/envs/samarthamp/bin/activate
-cd /home/sarcs/samarthamp
+source ~/envs/nsbench/bin/activate
+cd ~/Memory-Benchmark-Framework
 # or call it directly, without activating:
-/home/sarcs/envs/samarthamp/bin/nsbench --help
+~/envs/nsbench/bin/nsbench --help
 ```
 
 ## First time on a machine
 
 ```bash
-bash setup/create_env.sh      # build envs/samarthamp
+bash setup/create_env.sh      # build ~/envs/nsbench (ENV_DIR= to change)
 nsbench preflight             # probe GPU, tools, permissions, metric availability
 bash scripts/smoke_test.sh    # end-to-end check on a small model
 ```
@@ -425,8 +425,8 @@ How to read the result:
 
 ```bash
 # 0. Once per session
-source /home/sarcs/envs/samarthamp/bin/activate
-cd /home/sarcs/samarthamp
+source ~/envs/nsbench/bin/activate
+cd ~/Memory-Benchmark-Framework
 
 # 1. Once per machine (and again after a driver or metric-registry change)
 nsbench preflight

@@ -478,13 +478,17 @@ class DecodeExpectation:
     total_weight_bytes: int = 0
     expert_activation_ratio: float | None = None
 
+    #: Recurrent state a linear-attention layer writes back in full every step (the read is
+    #: already in ``kv_bytes``). Zero for models without linear-attention layers.
+    state_write_bytes: int = 0
+
     @property
     def is_moe(self) -> bool:
         return bool(self.expert_activation_ratio is not None and self.total_weight_bytes)
 
     @property
     def expected_bytes(self) -> int:
-        return self.weight_bytes + self.kv_bytes
+        return self.weight_bytes + self.kv_bytes + self.state_write_bytes
 
     @property
     def ratio(self) -> float | None:
@@ -535,6 +539,7 @@ class DecodeExpectation:
             "total_weight_bytes": self.total_weight_bytes or None,
             "expert_activation_ratio": self.expert_activation_ratio,
             "kv_bytes": self.kv_bytes,
+            "state_write_bytes": self.state_write_bytes or None,
             "expected_bytes": self.expected_bytes,
             "measured_bytes": self.measured_bytes,
             "ratio": self.ratio,
@@ -555,6 +560,7 @@ def check_decode_expectation(
     weight_bytes_source: str = "resident",
     total_weight_bytes: int = 0,
     expert_activation_ratio: float | None = None,
+    state_write_bytes: int = 0,
 ) -> DecodeExpectation:
     return DecodeExpectation(
         weight_bytes=weight_bytes,
@@ -564,6 +570,7 @@ def check_decode_expectation(
         weight_bytes_source=weight_bytes_source,
         total_weight_bytes=total_weight_bytes,
         expert_activation_ratio=expert_activation_ratio,
+        state_write_bytes=state_write_bytes,
     )
 
 

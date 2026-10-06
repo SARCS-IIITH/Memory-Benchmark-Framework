@@ -7,13 +7,14 @@
 
 set -euo pipefail
 
-ENV_DIR="${ENV_DIR:-/home/sarcs/envs/samarthamp}"
+ENV_DIR="${ENV_DIR:-${HOME}/envs/nsbench}"
 NSBENCH="${ENV_DIR}/bin/nsbench"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO}"
 
 # A small model keeps the run short. Override with SMOKE_MODEL=/path/to/checkpoint.
-DEFAULT_SMOKE_MODEL=$(ls -d "${HOME}"/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/ 2>/dev/null | head -1 || true)
+DEFAULT_SMOKE_MODEL=$(ls -d "${HOME}"/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/*/ \
+    "${STORE:-/opt/ai-models}"/hub/models--Qwen--Qwen3-0.6B/snapshots/*/ 2>/dev/null | head -1 || true)
 SMOKE_MODEL="${SMOKE_MODEL:-${DEFAULT_SMOKE_MODEL}}"
 
 if [[ -z "${SMOKE_MODEL}" || ! -d "${SMOKE_MODEL}" ]]; then

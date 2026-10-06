@@ -1,0 +1,18 @@
+# Optional extras for hybrid linear-attention + FP8 checkpoints (Kimi-Linear-48B-A3B).
+# Install on top of the main env:
+#   ~/envs/nsbench/bin/pip install -r setup/requirements-kimi.txt
+#
+# fla is pinned deliberately. Kimi-Linear's modelling code was written against fla 0.4:
+# 0.5.x removed fused_kda_gate's head_k_dim argument and renamed g_bias to dt_bias, so the
+# model fails on 0.5.2. Remapping the arguments instead was rejected -- a silent shape-
+# convention change inside an attention kernel would produce plausible wrong numbers.
+# 0.4.0's KDA Triton kernels were verified to compile and run on GB10 (sm_121).
+fla-core==0.4.0
+flash-linear-attention==0.4.0
+
+# FP8 (and other) compressed-tensors checkpoints; loaded with use_optimized_inference.
+compressed-tensors>=0.19
+
+# Kimi's tokenizer is tiktoken-based; its modelling code uses einops.
+tiktoken
+einops

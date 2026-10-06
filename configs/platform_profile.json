@@ -1,5 +1,5 @@
 {
-  "detected_at": "2026-08-22T01:00:00+00:00",
+  "detected_at": "2026-10-05T06:44:16+00:00",
   "hostname": "edgexpert-bc70",
   "kernel": "Linux 6.17.0-1021-nvidia",
   "arch": "aarch64",
@@ -38,7 +38,7 @@
     "nsys_cpu_sampling_available": false,
     "has_passwordless_sudo": false
   },
-  "python_executable": "/home/sarcs/envs/samarthamp/bin/python3.12",
+  "python_executable": "/home/imc/envs/nsbench/bin/python3.12",
   "torch_version": "2.13.0+cu130",
   "torch_cuda_version": "13.0",
   "nsys_gpu_metric_set": "gb20b",

@@ -1,0 +1,4 @@
+# Config/code/tokenizer files of nm-testing/Kimi-Linear-48B-A3B-Instruct-FP8-DYNAMIC (no weights).
+# Re-fetch with: huggingface_hub.snapshot_download(repo, allow_patterns=['*.json','*.py','*.jinja','tiktoken.model'])
+kimi-fp8-meta/
+__pycache__/

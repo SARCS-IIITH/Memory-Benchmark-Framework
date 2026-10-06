@@ -455,6 +455,15 @@ class MetricAvailability:
         """True when every metric flagged ``required`` is collectable."""
         return all(name in self.available for name in required_names())
 
+    @property
+    def probed(self) -> bool:
+        """Whether a probe produced any verdict at all.
+
+        ``preflight --quick`` skips the probe, and with no earlier profile to carry forward
+        both sets are empty -- which must not be read as "nothing is available".
+        """
+        return bool(self.available or self.missing)
+
     def missing_required(self) -> list[str]:
         return [n for n in required_names() if n not in self.available]
 

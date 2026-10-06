@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# OPTIONAL second environment: /home/sarcs/envs/samarthamp-trtllm
+# OPTIONAL second environment: ${HOME}/envs/nsbench-trtllm (override with ENV_DIR=)
 #
 # This is NOT run as part of the normal setup. It exists so the TensorRT-LLM backend can be
 # provisioned later without disturbing the main harness environment.
 #
 # Why a separate venv: tensorrt_llm pins its own torch build. Installing it alongside the
-# transformers stack in envs/samarthamp will replace torch and can break the reference backend.
+# transformers stack in envs/nsbench will replace torch and can break the reference backend.
 #
 # Status on this machine (checked 2026-08-22):
 #   * There is NO stable aarch64 tensorrt_llm release. Only 1.3.0rc* release candidates,
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-ENV_DIR="${ENV_DIR:-/home/sarcs/envs/samarthamp-trtllm}"
+ENV_DIR="${ENV_DIR:-${HOME}/envs/nsbench-trtllm}"
 PYTHON="${PYTHON:-python3.12}"
 TRTLLM_VERSION="${TRTLLM_VERSION:-1.3.0rc24}"
 NVIDIA_INDEX="${NVIDIA_INDEX:-https://pypi.nvidia.com}"

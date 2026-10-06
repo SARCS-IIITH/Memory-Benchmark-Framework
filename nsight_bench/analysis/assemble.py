@@ -160,6 +160,13 @@ class FootprintAnalysis:
     nsys_peak_outstanding: int | None = None
     model_weight_bytes_resident: int | None = None
     kv_cache_bytes: int | None = None
+    #: The measured decoding state by kind (kv / recurrent_state / conv_state), when the
+    #: backend reported it. A hybrid model's recurrent state does not grow with context.
+    cache_state_bytes: dict[str, int] = field(default_factory=dict)
+    #: For MLA models: the KV part as transformers stores it (expanded) and as the latent an
+    #: MLA-native engine would hold, at the end-of-generation context.
+    mla_expanded_kv_bytes: int | None = None
+    mla_latent_kv_bytes: int | None = None
     host_available_delta: int | None = None
     #: True on a part where the GPU and the host share one physical pool, as on GB10. It
     #: changes what ``cuda_peak_used`` means, so it must be known before that figure is
@@ -235,6 +242,9 @@ class FootprintAnalysis:
             "nsys_peak_outstanding_bytes": self.nsys_peak_outstanding,
             "model_weight_bytes_resident": self.model_weight_bytes_resident,
             "kv_cache_bytes": self.kv_cache_bytes,
+            "cache_state_bytes": self.cache_state_bytes or None,
+            "mla_expanded_kv_bytes": self.mla_expanded_kv_bytes,
+            "mla_latent_kv_bytes": self.mla_latent_kv_bytes,
             "host_available_delta_bytes": self.host_available_delta,
             "process_footprint_bytes": self.process_footprint_bytes(),
             "agreement": self.agreement(),
@@ -601,6 +611,8 @@ def _load_timing_and_footprint(analysis: RunAnalysis, root: Path, manifest: dict
         analysis.footprint.unified_memory = analysis.platform.gpu.unified_memory
 
     backend = payload.get("backend", {})
+    if isinstance(backend.get("cache_state_bytes"), dict):
+        analysis.footprint.cache_state_bytes = dict(backend["cache_state_bytes"])
     resident = backend.get("parameter_bytes_resident")
     if resident:
         analysis.footprint.model_weight_bytes_resident = resident + (
@@ -766,42 +778,65 @@ def _cross_check(analysis: RunAnalysis) -> None:
         # on-disk fallback counts both copies and would overstate the expectation by a whole
         # embedding matrix, which on a large-vocabulary model is easily a quarter of the
         # total and enough to move the ratio across a verdict boundary.
+        model = analysis.model
         resident = analysis.footprint.model_weight_bytes_resident
         if resident:
             weight_bytes, source = resident, "resident"
         else:
-            weight_bytes, source = analysis.model.estimated_weight_bytes(), "on-disk"
+            weight_bytes, source = model.estimated_weight_bytes(), "on-disk"
+            if model.on_disk_may_double_count_embeddings():
+                analysis.warnings.append(
+                    "The decode expectation falls back to the checkpoint's on-disk size "
+                    "because the resident parameter count is unavailable. This checkpoint "
+                    "ties its embeddings but stores both copies, so the expectation "
+                    "overstates the weights by one embedding matrix "
+                    f"(~{model.embedding_matrix_bytes() / 1e6:,.0f} MB) and the "
+                    "measured/expected ratio below reads correspondingly low."
+                )
 
         # A mixture of experts reads only the experts a token routes to, so the resident
         # total is the wrong yardstick -- it would predict roughly num_experts/top_k times
         # the traffic a step actually moves and turn a correctly-working model into a
-        # scoping alarm. Scale to the active subset, and keep the total so the report can
-        # show both.
+        # scoping alarm. The expectation is the routed-active subset, taken from the same
+        # place discovery took it: the checkpoint's own tensors, classified by role, where
+        # those are known. Attention, shared experts, dense layers, routers and the LM head
+        # are read in full; routed experts at top_k/num_experts; input-embedding gathers and
+        # vision/audio towers not at all. (This previously scaled everything but the
+        # embedding by the expert ratio -- attention included -- which disagreed with
+        # ModelConfig.active_weight_bytes and understated Kimi-Linear's expectation by ~30%.)
         total_weight_bytes = 0
-        activation = analysis.model.expert_activation_ratio
+        activation = model.expert_activation_ratio
         if activation is not None:
             total_weight_bytes = weight_bytes
-            dense_part = analysis.model.embedding_matrix_bytes()
-            weight_bytes = int(
-                dense_part + max(0, weight_bytes - dense_part) * activation
-            )
-            source += " (routed-active)"
-            if analysis.model.tie_word_embeddings:
-                analysis.warnings.append(
-                    "The decode expectation falls back to the checkpoint's on-disk size "
-                    "because the resident parameter count is unavailable. This model ties "
-                    "its input and output embeddings, so if the checkpoint stores both "
-                    "copies the expectation overstates the weights by one embedding matrix "
-                    f"(~{analysis.model.embedding_matrix_bytes() / 1e6:,.0f} MB) and the "
-                    "measured/expected ratio below reads correspondingly low."
-                )
+            weight_bytes, how = model.decode_read_weight_bytes()
+            source = f"{how} (routed-active)"
+
+        # A linear-attention layer's recurrent state is read *and rewritten in full* on every
+        # step -- unlike a KV cache, which only appends one token. The measured cache size
+        # covers the read; the write-back is added here so the expectation is not short by it.
+        state_write_bytes = 0
+        if model.linear_attn_layers:
+            batch = analysis.workload.batch_size if analysis.workload else 1
+            state_write_bytes = model.kv_cache_breakdown(1, batch).get("recurrent_state", 0)
 
         decode.expectation = check_decode_expectation(
             decode.hierarchy, weight_bytes, kv_bytes, context_len,
             weight_bytes_source=source,
             total_weight_bytes=total_weight_bytes,
             expert_activation_ratio=activation,
+            state_write_bytes=state_write_bytes,
         )
+
+    # For MLA, what transformers caches (expanded per-head K/V) is not what MLA is designed
+    # to cache. Record the latent size so the report can put the two side by side.
+    if analysis.model and analysis.model.is_mla and analysis.workload:
+        context = analysis.workload.prompt_tokens + analysis.workload.generate_tokens
+        analysis.footprint.mla_latent_kv_bytes = analysis.model.mla_latent_kv_bytes(
+            context, analysis.workload.batch_size
+        )
+        analysis.footprint.mla_expanded_kv_bytes = analysis.model.kv_cache_breakdown(
+            context, analysis.workload.batch_size
+        ).get("kv")
 
     # A rate above the machine's own measured ceiling is impossible, so when the
     # real-latency substitution produces one it has bounded its own error for us.

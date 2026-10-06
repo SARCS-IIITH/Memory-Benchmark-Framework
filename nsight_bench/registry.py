@@ -218,7 +218,8 @@ def snapshot_path(entry: RegistryEntry, store: str | Path) -> Path | None:
 #: double the transfer for files the harness will never read.
 DEFAULT_PATTERNS = [
     "*.safetensors", "*.safetensors.index.json", "config.json",
-    "generation_config.json", "tokenizer*", "*.model", "preprocessor_config.json",
+    "generation_config.json", "tokenizer*", "special_tokens_map.json", "*.model",
+    "preprocessor_config.json",
     "chat_template.*", "*.py",
 ]
 

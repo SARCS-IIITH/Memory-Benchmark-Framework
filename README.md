@@ -10,7 +10,7 @@ trusted.
 
 ```bash
 bash setup/create_env.sh
-source /home/sarcs/envs/samarthamp/bin/activate
+source ~/envs/nsbench/bin/activate
 
 nsbench preflight
 nsbench discover /path/to/checkpoint --name my-model

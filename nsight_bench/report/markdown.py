@@ -68,7 +68,7 @@ def _header(analysis: RunAnalysis) -> str:
         rows.append([
             "Shape",
             f"{model.num_layers} layers, hidden {model.hidden_size}, "
-            f"{model.num_attention_heads} heads / {model.num_key_value_heads} KV heads",
+            f"{model.describe_attention()}",
         ])
         weights = (
             f"{fmt_bytes(model.weight_bytes_on_disk)} on disk, "
@@ -518,10 +518,20 @@ def _expectation(analysis: RunAnalysis) -> str:
     )
     lines.append("")
 
+    weights_label = "Weights"
+    if expectation.is_moe:
+        weights_label = (f"Weights read (routed-active, of "
+                         f"{fmt_bytes(expectation.total_weight_bytes)} resident)")
     rows = [
-        ["Weights", fmt_bytes(expectation.weight_bytes)],
-        ["KV cache", fmt_bytes(expectation.kv_bytes)
+        [weights_label, fmt_bytes(expectation.weight_bytes)
+         + f" -- {expectation.weight_bytes_source}"],
+        ["KV cache" + (" + recurrent state (read)" if expectation.state_write_bytes else ""),
+         fmt_bytes(expectation.kv_bytes)
          + (f" (context {expectation.context_len})" if expectation.context_len else "")],
+    ]
+    if expectation.state_write_bytes:
+        rows.append(["Recurrent state written back", fmt_bytes(expectation.state_write_bytes)])
+    rows += [
         ["**Expected total**", f"**{fmt_bytes(expectation.expected_bytes)}**"],
         ["**Measured**", f"**{fmt_bytes(expectation.measured_bytes)}**"],
         ["Ratio", fmt_ratio(expectation.ratio)],
@@ -553,9 +563,19 @@ def _footprint(analysis: RunAnalysis) -> str:
          "allocations made inside the traced region only"],
         ["Model weights resident", fmt_bytes(footprint.model_weight_bytes_resident),
          "parameters plus buffers, as loaded"],
-        ["KV cache", fmt_bytes(footprint.kv_cache_bytes),
-         "measured from the live cache tensors"],
+        ["KV cache" + (" + recurrent state" if footprint.cache_state_bytes.get("recurrent_state")
+                       else ""),
+         fmt_bytes(footprint.kv_cache_bytes),
+         "measured from the live cache tensors"
+         + (" -- " + ", ".join(f"{k} {fmt_bytes(v)}" for k, v in footprint.cache_state_bytes.items())
+            if len(footprint.cache_state_bytes) > 1 else "")],
     ]
+    if footprint.mla_latent_kv_bytes:
+        rows.append([
+            "MLA latent equivalent", fmt_bytes(footprint.mla_latent_kv_bytes),
+            "what an MLA-native engine would cache; transformers holds the expanded "
+            f"per-head K/V instead ({fmt_bytes(footprint.mla_expanded_kv_bytes)})",
+        ])
     if footprint.host_available_delta:
         rows.append([
             "Host pool drawn down by load",

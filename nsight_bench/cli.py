@@ -140,17 +140,28 @@ def cmd_discover(args: argparse.Namespace) -> int:
     print(f"  path            {model.path}")
     print(f"  architecture    {model.architecture} ({model.model_type})")
     print(f"  layers          {model.num_layers}")
-    print(f"  hidden / heads  {model.hidden_size} / {model.num_attention_heads} "
-          f"(kv {model.num_key_value_heads}, head_dim {model.head_dim})")
+    print(f"  hidden          {model.hidden_size}")
+    print(f"  attention       {model.describe_attention()}")
     print(f"  quantization    {model.quantization or 'none'} "
           f"({model.bits_per_weight} bits/weight)")
     print(f"  weights on disk {model.weight_bytes_on_disk / 1e9:.2f} GB "
           f"across {len(model.safetensors_files)} file(s)")
     print(f"  est. parameters {model.param_count / 1e9:.2f} B")
+    if model.is_moe and model.weight_bytes_by_role:
+        read, _ = model.decode_read_weight_bytes()
+        print(f"  decode reads    {read / 1e9:.2f} GB of weights per batch-1 token "
+              "(routed-active, from the checkpoint's tensors)")
     for length in (512, 2048, 8192):
-        kv = model.kv_cache_bytes(length)
-        if kv:
-            print(f"  KV cache @{length:>5} {kv / 1e6:8.1f} MB")
+        parts = model.kv_cache_breakdown(length)
+        if not parts:
+            continue
+        line = f"  KV cache @{length:>5} {sum(parts.values()) / 1e6:8.1f} MB"
+        if len(parts) > 1:
+            line += "  (" + ", ".join(f"{k} {v / 1e6:,.1f}" for k, v in parts.items()) + ")"
+        latent = model.mla_latent_kv_bytes(length)
+        if latent is not None:
+            line += f"  | MLA latent would be {latent / 1e6:,.1f} MB"
+        print(line)
     for note in model.notes:
         print(f"  note: {note}")
 

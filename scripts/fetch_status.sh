@@ -6,7 +6,7 @@
 # reporting healthy hours after a stall.
 set -uo pipefail
 STORE="${STORE:-/opt/ai-models}"
-NSBENCH="${NSBENCH:-/home/samarthamp/envs/samarthamp/bin/nsbench}"
+NSBENCH="${NSBENCH:-${ENV_DIR:-${HOME}/envs/nsbench}/bin/nsbench}"
 
 if pgrep -f "nsight_bench.cli fetch" >/dev/null; then
     echo "fetch: RUNNING (pid $(pgrep -f 'nsight_bench.cli fetch' | head -1))"

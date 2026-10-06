@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision the main harness environment: /home/sarcs/envs/samarthamp
+# Provision the main harness environment: ${HOME}/envs/nsbench (override with ENV_DIR=)
 #
 # Mirrors the known-good stack on this box (torch 2.13.0+cu130 aarch64 + transformers 5.x),
 # which was verified to run bf16 matmuls on the GB10.
@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-ENV_DIR="${ENV_DIR:-/home/sarcs/envs/samarthamp}"
+ENV_DIR="${ENV_DIR:-${HOME}/envs/nsbench}"
 PYTHON="${PYTHON:-python3.12}"
 TORCH_VERSION="${TORCH_VERSION:-2.13.0}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"

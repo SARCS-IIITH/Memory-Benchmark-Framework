@@ -1,4 +1,4 @@
-name: Qwen3-0.6B
+name: smoke-model
 path: /opt/ai-models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
 dtype: bfloat16
 attn_implementation: sdpa
@@ -23,29 +23,6 @@ num_experts: 0
 num_experts_per_token: 0
 num_shared_experts: 0
 num_moe_layers: 0
-kv_lora_rank: 0
-q_lora_rank: 0
-qk_rope_head_dim: 0
-qk_nope_head_dim: 0
-v_head_dim: 0
-linear_attn_layers: []
-sliding_attn_layers: []
-sliding_window: 0
-linear_attn_num_heads: 0
-linear_attn_key_head_dim: 0
-linear_attn_value_head_dim: 0
-linear_attn_conv_kernel: 0
-linear_attn_conv_channels: 0
-linear_attn_kind: ''
-linear_attn_state_dtype_bytes: 4
-no_cache_layers: []
-full_attn_head_dim: 0
-first_k_dense_layers: 0
-weight_bytes_by_role:
-  lm_head: 311164928
-  embedding: 311164928
-  other: 880934912
-quant_bits: null
 param_count: 751650164
 weight_bytes_on_disk: 1503300328
 safetensors_files:

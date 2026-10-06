@@ -176,6 +176,58 @@ class ModelConfig:
     #: the first N layers dense, so this is not always equal to num_layers.
     num_moe_layers: int = 0
 
+    # ---- attention variants ------------------------------------------------------------
+    #: Multi-head latent attention (DeepSeek-V2/V3, Kimi, Mistral 4). K and V are projected
+    #: through a ``kv_lora_rank`` latent plus a ``qk_rope_head_dim`` rotary key. The standard
+    #: ``head_dim`` means nothing here -- on Kimi-Linear it reads 72, which is hidden/heads and
+    #: corresponds to no tensor in the model -- so every MLA quantity is computed from these.
+    kv_lora_rank: int = 0
+    q_lora_rank: int = 0
+    qk_rope_head_dim: int = 0
+    qk_nope_head_dim: int = 0
+    v_head_dim: int = 0
+
+    #: Hybrid layouts, 0-based layer indices. Linear-attention layers (Kimi's KDA, Qwen3.5's
+    #: Gated DeltaNet) keep a fixed-size recurrent state instead of a KV cache; sliding-window
+    #: layers keep at most ``sliding_window`` tokens. Every other layer is full attention.
+    linear_attn_layers: list[int] = field(default_factory=list)
+    sliding_attn_layers: list[int] = field(default_factory=list)
+    sliding_window: int = 0
+    #: Shape of a linear-attention layer's state: ``num_heads`` value heads of a
+    #: ``key_head_dim x value_head_dim`` fp32 matrix, plus a short-convolution window of
+    #: ``conv_kernel`` steps over ``conv_channels`` channels.
+    linear_attn_num_heads: int = 0
+    linear_attn_key_head_dim: int = 0
+    linear_attn_value_head_dim: int = 0
+    linear_attn_conv_kernel: int = 0
+    linear_attn_conv_channels: int = 0
+    #: Which recurrent-state model the shape above came from ("kda", "gated_deltanet",
+    #: "mamba2"). Only "kda" has been checked against a measured cache.
+    linear_attn_kind: str = ""
+    #: Bytes per recurrent-state element: fla's KDA and DeltaNet kernels keep fp32 state,
+    #: transformers' Mamba-2 cache keeps it in the model dtype.
+    linear_attn_state_dtype_bytes: int = 4
+    #: Layers that carry no decoding state at all -- the MLP/MoE-only blocks of a layer
+    #: pattern such as Nemotron-H's, where attention, Mamba and MoE are separate layers.
+    no_cache_layers: list[int] = field(default_factory=list)
+    #: A distinct head dimension for the full-attention layers of a mixed-width model
+    #: (Gemma 4's global layers), when the config declares one.
+    full_attn_head_dim: int = 0
+
+    #: Leading layers that are dense rather than MoE (``first_k_dense_replace``).
+    first_k_dense_layers: int = 0
+
+    #: Exact checkpoint bytes by tensor role, from the safetensors headers: routed_experts,
+    #: embedding (input-side gathers), lm_head, multimodal (vision/audio towers), other.
+    #: What a decode step must read is computed from this rather than from a formula over
+    #: config fields, because the tensors are the ground truth for every architecture --
+    #: MLA and KDA projections, quantization scales and all.
+    weight_bytes_by_role: dict[str, int] = field(default_factory=dict)
+
+    #: Bits per stored weight as declared by the quantization config, when it states one.
+    #: Overrides the per-scheme table: ``compressed-tensors`` alone says nothing about width.
+    quant_bits: int | None = None
+
     param_count: int = 0
     weight_bytes_on_disk: int = 0
     safetensors_files: list[str] = field(default_factory=list)
@@ -183,7 +235,52 @@ class ModelConfig:
 
     @property
     def bits_per_weight(self) -> int:
+        if self.quant_bits:
+            return int(self.quant_bits)
         return BITS_PER_WEIGHT.get(self.quantization or self.dtype, 16)
+
+    @property
+    def is_mla(self) -> bool:
+        return bool(self.kv_lora_rank)
+
+    @property
+    def is_hybrid(self) -> bool:
+        return bool(self.linear_attn_layers or self.sliding_attn_layers or self.no_cache_layers)
+
+    def attention_layout(self) -> dict[str, int]:
+        """Layer counts by attention kind."""
+        linear = len(set(self.linear_attn_layers))
+        sliding = len(set(self.sliding_attn_layers) - set(self.linear_attn_layers))
+        none = len(set(self.no_cache_layers) - set(self.linear_attn_layers)
+                   - set(self.sliding_attn_layers))
+        return {
+            "full": max(0, self.num_layers - linear - sliding - none),
+            "sliding": sliding,
+            "linear": linear,
+            "none": none,
+        }
+
+    def describe_attention(self) -> str:
+        """One line naming the attention design, for reports."""
+        layout = self.attention_layout()
+        if self.is_mla:
+            kind = (f"MLA (kv_lora_rank {self.kv_lora_rank}, rope {self.qk_rope_head_dim}, "
+                    f"{self.num_attention_heads} heads)")
+        else:
+            kind = (f"{self.num_attention_heads} heads / {self.num_key_value_heads} KV heads, "
+                    f"head_dim {self.head_dim}")
+        if not self.is_hybrid:
+            return kind
+        parts = [f"{layout['full']} full-attention layers: {kind}"]
+        if layout["sliding"]:
+            parts.append(f"{layout['sliding']} sliding-window ({self.sliding_window} tokens)")
+        if layout["linear"]:
+            name = {"kda": "Kimi Delta Attention", "gated_deltanet": "Gated DeltaNet",
+                    "mamba2": "Mamba-2"}.get(self.linear_attn_kind, "linear attention")
+            parts.append(f"{layout['linear']} {name} (fixed-size recurrent state)")
+        if layout["none"]:
+            parts.append(f"{layout['none']} MLP/MoE-only (no cache)")
+        return "; ".join(parts)
 
     @property
     def kv_dtype_bytes(self) -> int:
@@ -238,13 +335,33 @@ class ModelConfig:
         active = self.num_experts_per_token + self.num_shared_experts
         return min(1.0, active / self.num_experts)
 
+    @property
+    def routed_activation_ratio(self) -> float | None:
+        """Fraction of the *routed* expert weights one token reads: top_k / num_experts.
+
+        Distinct from :attr:`expert_activation_ratio`, which folds shared experts into the
+        numerator. Shared experts are separate tensors, read in full by every token, so when
+        the checkpoint's tensors are classified by role they belong with the always-read part
+        and only the routed experts are scaled.
+        """
+        if not self.is_moe:
+            return None
+        return min(1.0, self.num_experts_per_token / self.num_experts)
+
     def attention_bytes(self) -> int:
         """Bytes of attention projection weights across all layers.
 
         Q, K, V and O for every block. Grouped-query attention is accounted for -- K and V
         project to ``num_key_value_heads`` rather than the full head count, which on these
         models is a 4-8x difference and would badly overstate the total if ignored.
+
+        For MLA the projections are the latent ones (``q_a``/``q_b`` or ``q_proj``,
+        ``kv_a_proj_with_mqa``, ``kv_b_proj``, ``o_proj``). Linear-attention layers have
+        projections of their own that no formula here models; this is only the fallback for
+        checkpoints without :attr:`weight_bytes_by_role`, which sizes them exactly.
         """
+        if self.is_mla:
+            return self._mla_attention_bytes()
         head_dim = self.head_dim or (
             self.hidden_size // self.num_attention_heads if self.num_attention_heads else 0
         )
@@ -259,11 +376,57 @@ class ModelConfig:
         )
         return int(per_layer * self.num_layers * self.bits_per_weight / 8)
 
+    def _mla_attention_bytes(self) -> int:
+        heads, hidden = self.num_attention_heads, self.hidden_size
+        qk = self.qk_nope_head_dim + self.qk_rope_head_dim
+        v = self.v_head_dim or self.qk_nope_head_dim
+        if not (heads and hidden and qk and v):
+            return 0
+        if self.q_lora_rank:
+            q = hidden * self.q_lora_rank + self.q_lora_rank * heads * qk
+        else:
+            q = hidden * heads * qk
+        kv_a = hidden * (self.kv_lora_rank + self.qk_rope_head_dim)
+        kv_b = self.kv_lora_rank * heads * (self.qk_nope_head_dim + v)
+        o = heads * v * hidden
+        layers = self.attention_layout()["full"] + self.attention_layout()["sliding"]
+        return int((q + kv_a + kv_b + o) * layers * self.bits_per_weight / 8)
+
+    def decode_read_weight_bytes(self) -> tuple[int, str]:
+        """Weight bytes one batch-1 decode step must read, and how that figure was obtained.
+
+        From the checkpoint's own tensors when discovery classified them
+        (:attr:`weight_bytes_by_role`), which is exact for any architecture:
+
+        * routed experts at ``top_k / num_experts`` of their stored size;
+        * the input embedding excluded -- a step gathers one row per token, not the matrix;
+        * vision and audio towers excluded -- a text decode step never touches them;
+        * everything else in full: attention of whatever kind, shared experts, dense
+          layers, routers, norms, the LM head (or, if the embedding is tied and no separate
+          LM head is stored, the embedding matrix, which the output projection reads).
+
+        Otherwise :meth:`active_weight_bytes`, the formula-based estimate.
+        """
+        roles = self.weight_bytes_by_role
+        if not roles:
+            return self.active_weight_bytes(), "estimate from config"
+        routed = roles.get("routed_experts", 0)
+        embedding = roles.get("embedding", 0)
+        lm_head = roles.get("lm_head", 0)
+        read = (sum(roles.values()) - roles.get("multimodal", 0) - embedding - routed)
+        if not lm_head and self.tie_word_embeddings:
+            read += embedding
+        ratio = self.routed_activation_ratio
+        read += int(routed * ratio) if ratio is not None else routed
+        return int(read), "checkpoint tensors by role"
+
     def active_weight_bytes(self) -> int:
         """Weight bytes a single decode step actually reads.
 
         For a dense model this is every weight, and the answer is just
-        :meth:`estimated_weight_bytes`.
+        :meth:`estimated_weight_bytes`. Where the checkpoint's tensors have been classified,
+        a mixture of experts uses :meth:`decode_read_weight_bytes` instead, which is exact;
+        what follows is the fallback for configs discovered before that existed.
 
         For a mixture of experts it is not. Only ``top_k`` of ``num_experts`` are routed to
         per token, so the expert parameters -- which on these architectures are the large
@@ -284,6 +447,8 @@ class ModelConfig:
         ratio = self.expert_activation_ratio
         if ratio is None or not total:
             return total
+        if self.weight_bytes_by_role:
+            return self.decode_read_weight_bytes()[0]
 
         if self.tie_word_embeddings and self.stores_lm_head:
             # The checkpoint stores two copies but a step reads the matrix once.
@@ -307,25 +472,94 @@ class ModelConfig:
     def kv_cache_bytes(
         self, seq_len: int, batch_size: int = 1, kv_dtype_bytes: int | None = None
     ) -> int:
-        """Analytic KV-cache size for a given context length.
+        """Analytic decoding-state size for a given context length.
 
-        2 (K and V) x layers x kv_heads x head_dim x seq_len x batch x dtype_bytes.
-        Uses ``num_key_value_heads`` so grouped-query attention is accounted for correctly --
-        assuming full attention heads would overstate this several-fold on modern models.
+        For a uniform full-attention model this is the classic
+        2 (K and V) x layers x kv_heads x head_dim x seq_len x batch x dtype_bytes, with
+        ``num_key_value_heads`` so grouped-query attention is accounted for -- assuming full
+        attention heads would overstate this several-fold on modern models.
+
+        Hybrid and MLA models are summed per layer kind by :meth:`kv_cache_breakdown`, which
+        includes any linear-attention recurrent state. MLA is sized **as transformers caches
+        it** (expanded per-head K and V), because that is what the measured cache holds; see
+        :meth:`mla_latent_kv_bytes` for the compressed size an MLA-native engine would store.
+        """
+        return sum(self.kv_cache_breakdown(seq_len, batch_size, kv_dtype_bytes).values())
+
+    def kv_cache_breakdown(
+        self, seq_len: int, batch_size: int = 1, kv_dtype_bytes: int | None = None,
+        mla_latent: bool = False,
+    ) -> dict[str, int]:
+        """Decoding-state bytes by kind: ``kv``, ``recurrent_state``, ``conv_state``.
+
+        * Full-attention layers grow with context. MLA layers hold
+          ``heads x (qk_nope + qk_rope)`` keys and ``heads x v_head_dim`` values per token as
+          transformers stores them, or ``kv_lora_rank + qk_rope_head_dim`` per token as the
+          latent (``mla_latent=True``).
+        * Sliding-window layers hold at most ``sliding_window`` tokens.
+        * Linear-attention layers hold a fixed fp32 state of ``num_heads x key_dim x
+          value_dim`` and a short-convolution window, regardless of context. For KDA this
+          was checked against a live Kimi-Linear cache (exact match at 84 tokens);
+          for Gated DeltaNet it is the documented shape, not yet measured.
         """
         if kv_dtype_bytes is None:
             kv_dtype_bytes = self.kv_dtype_bytes
-        if not (self.num_layers and self.num_key_value_heads):
-            return 0
-        head_dim = self.head_dim or (
+        layout = self.attention_layout()
+        elements = layout["full"] * seq_len * self._kv_elements_per_token(mla_latent)
+        if layout["sliding"]:
+            window = self.sliding_window or seq_len
+            elements += (layout["sliding"] * min(seq_len, window)
+                         * self._kv_elements_per_token(mla_latent, sliding=True))
+
+        breakdown = {
+            "kv": int(elements * batch_size * kv_dtype_bytes),
+            "recurrent_state": 0,
+            "conv_state": 0,
+        }
+        if layout["linear"] and self.linear_attn_num_heads:
+            heads = self.linear_attn_num_heads
+            key_dim = self.linear_attn_key_head_dim
+            value_dim = self.linear_attn_value_head_dim or key_dim
+            breakdown["recurrent_state"] = (
+                layout["linear"] * batch_size * heads * key_dim * value_dim
+                * self.linear_attn_state_dtype_bytes
+            )
+            if self.linear_attn_conv_kernel and self.linear_attn_conv_channels:
+                breakdown["conv_state"] = (
+                    layout["linear"] * batch_size * self.linear_attn_conv_channels
+                    * self.linear_attn_conv_kernel * 2
+                )
+        return {k: v for k, v in breakdown.items() if v}
+
+    def _kv_elements_per_token(self, mla_latent: bool = False, sliding: bool = False) -> int:
+        """K plus V elements one attention layer caches per token.
+
+        ``sliding`` selects the sliding-window layers' width; full-attention layers use
+        :attr:`full_attn_head_dim` where a mixed-width model declares one.
+        """
+        if self.is_mla:
+            if mla_latent:
+                return self.kv_lora_rank + self.qk_rope_head_dim
+            heads = self.num_attention_heads
+            v = self.v_head_dim or self.qk_nope_head_dim
+            return heads * (self.qk_nope_head_dim + self.qk_rope_head_dim) + heads * v
+        head_dim = (None if sliding else self.full_attn_head_dim) or self.head_dim or (
             self.hidden_size // self.num_attention_heads if self.num_attention_heads else 0
         )
-        if not head_dim:
+        if not (self.num_layers and self.num_key_value_heads and head_dim):
             return 0
-        return (
-            2 * self.num_layers * self.num_key_value_heads * head_dim
-            * seq_len * batch_size * kv_dtype_bytes
-        )
+        return 2 * self.num_key_value_heads * head_dim
+
+    def mla_latent_kv_bytes(self, seq_len: int, batch_size: int = 1) -> int | None:
+        """KV bytes an MLA-native engine would hold -- the compressed latent, not expanded K/V.
+
+        ``None`` for non-MLA models. Reported next to the measured cache so the gap between
+        what transformers stores and what MLA is designed to store stays visible: on
+        Kimi-Linear it is ~18x.
+        """
+        if not self.is_mla:
+            return None
+        return self.kv_cache_breakdown(seq_len, batch_size, mla_latent=True).get("kv", 0)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -450,6 +684,165 @@ def _safetensors_keys(directory: Path, files: list[str]) -> set[str]:
         except (OSError, ValueError, UnicodeDecodeError):
             continue
     return keys
+
+
+#: Bytes per element for every safetensors dtype tag. Packed low-bit formats are stored as
+#: I32/U8 words, so numel x element size is exact for them too.
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4,
+    "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+    "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1, "I8": 1, "U8": 1, "BOOL": 1,
+    "F4": 0.5, "F6_E2M3": 0.75, "F6_E3M2": 0.75,
+}
+
+#: Tensor-name patterns for each role a decode step treats differently. Checked in order.
+_ROLE_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    # Vision and audio towers: resident, but a text decode step never reads them.
+    ("multimodal", re.compile(
+        r"(^|\.)(vision_tower|vision_model|visual|vision_encoder|audio_tower|audio_model|"
+        r"audio_encoder|sound_encoder|multi_modal_projector|mm_projector|embed_vision|"
+        r"embed_audio)(\.|$)")),
+    ("lm_head", re.compile(r"(^|\.)lm_head\.")),
+    # Input-side lookup tables: a step gathers one row per token, not the whole matrix.
+    ("embedding", re.compile(r"(^|\.)(embed_tokens(_per_layer)?|wte|word_embeddings)\.")),
+    # Routed experts, per-expert (experts.7.w1) or fused (experts.gate_up_proj). Shared
+    # experts are read by every token and fall through to "other".
+    ("routed_experts", re.compile(r"(^|\.)experts\.")),
+)
+
+
+def _tensor_bytes_by_role(directory: Path, files: list[str]) -> dict[str, int]:
+    """Exact checkpoint bytes by role, from each shard's safetensors header.
+
+    One small read per shard -- the header is JSON giving every tensor's dtype and shape --
+    so this costs milliseconds even on a 50 GB checkpoint and loads no weights. Returns an
+    empty dict if any shard header cannot be read, so callers fall back to the estimate
+    rather than using a partial count.
+    """
+    totals: dict[str, int] = {}
+    for name in files:
+        try:
+            with open(directory / name, "rb") as handle:
+                header_len = int.from_bytes(handle.read(8), "little")
+                if not 0 < header_len < 100 * 1024 * 1024:
+                    return {}
+                header = json.loads(handle.read(header_len).decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return {}
+        for tensor, spec in header.items():
+            if tensor == "__metadata__" or not isinstance(spec, dict):
+                continue
+            size = _SAFETENSORS_DTYPE_BYTES.get(str(spec.get("dtype")))
+            if size is None:
+                return {}
+            numel = 1
+            for dim in spec.get("shape") or []:
+                numel *= int(dim)
+            role = "other"
+            if "shared_expert" not in tensor:
+                for candidate, pattern in _ROLE_PATTERNS:
+                    if pattern.search(tensor):
+                        role = candidate
+                        break
+            elif _ROLE_PATTERNS[0][1].search(tensor):
+                role = "multimodal"
+            totals[role] = totals.get(role, 0) + int(numel * size)
+    return totals
+
+
+def _detect_attention_layout(text_config: dict) -> dict:
+    """MLA fields and the hybrid layer layout, from whichever spelling the config uses."""
+    out: dict[str, Any] = {}
+    for key in ("kv_lora_rank", "q_lora_rank", "qk_rope_head_dim", "qk_nope_head_dim",
+                "v_head_dim"):
+        value = text_config.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            out[key] = value
+
+    layers = text_config.get("num_hidden_layers") or 0
+
+    # Kimi-Linear: linear_attn_config lists 1-based layer numbers (is_kda_layer checks idx+1).
+    kimi = text_config.get("linear_attn_config")
+    if isinstance(kimi, dict) and kimi.get("kda_layers"):
+        heads = int(kimi.get("num_heads") or 0)
+        head_dim = int(kimi.get("head_dim") or 0)
+        out.update(
+            linear_attn_layers=sorted(int(i) - 1 for i in kimi["kda_layers"]),
+            linear_attn_kind="kda",
+            linear_attn_num_heads=heads,
+            linear_attn_key_head_dim=head_dim,
+            linear_attn_value_head_dim=head_dim,
+            # Short convolutions over q, k and v, each heads x head_dim wide.
+            linear_attn_conv_channels=3 * heads * head_dim,
+            linear_attn_conv_kernel=int(kimi.get("short_conv_kernel_size") or 0),
+        )
+
+    # Generic: layer_types (Qwen3.5/3.6 linear_attention, Gemma sliding_attention).
+    types = text_config.get("layer_types")
+    if isinstance(types, list) and len(types) == layers:
+        linear = [i for i, t in enumerate(types) if "linear" in str(t)]
+        sliding = [i for i, t in enumerate(types) if "sliding" in str(t)]
+        if linear and "linear_attn_layers" not in out:
+            k_heads = int(text_config.get("linear_num_key_heads") or 0)
+            v_heads = int(text_config.get("linear_num_value_heads") or k_heads)
+            k_dim = int(text_config.get("linear_key_head_dim") or 0)
+            v_dim = int(text_config.get("linear_value_head_dim") or k_dim)
+            out.update(
+                linear_attn_layers=linear,
+                linear_attn_kind="gated_deltanet",
+                linear_attn_num_heads=v_heads,
+                linear_attn_key_head_dim=k_dim,
+                linear_attn_value_head_dim=v_dim,
+                # One causal conv over the concatenated q, k (key width) and v (value width).
+                linear_attn_conv_channels=2 * k_heads * k_dim + v_heads * v_dim,
+                linear_attn_conv_kernel=int(text_config.get("linear_conv_kernel_dim") or 0),
+            )
+        if sliding:
+            out["sliding_attn_layers"] = sliding
+            out["sliding_window"] = int(text_config.get("sliding_window") or 0)
+    # Nemotron-H: one character per layer -- '*' attention, 'M' Mamba-2, 'E' MoE, '-' MLP.
+    pattern = text_config.get("hybrid_override_pattern")
+    if isinstance(pattern, str) and len(pattern) == layers and "linear_attn_layers" not in out:
+        heads = int(text_config.get("mamba_num_heads") or 0)
+        head_dim = int(text_config.get("mamba_head_dim") or 0)
+        state = int(text_config.get("ssm_state_size") or 0)
+        groups = int(text_config.get("n_groups") or 1)
+        out.update(
+            linear_attn_layers=[i for i, c in enumerate(pattern) if c == "M"],
+            no_cache_layers=[i for i, c in enumerate(pattern) if c in "E-"],
+            linear_attn_kind="mamba2",
+            linear_attn_num_heads=heads,
+            linear_attn_key_head_dim=head_dim,
+            linear_attn_value_head_dim=state,
+            linear_attn_state_dtype_bytes=2,
+            # Mamba-2's causal conv runs over x plus the B and C projections.
+            linear_attn_conv_channels=heads * head_dim + 2 * groups * state,
+            linear_attn_conv_kernel=int(text_config.get("conv_kernel") or 0),
+        )
+    global_head_dim = text_config.get("global_head_dim")
+    if isinstance(global_head_dim, int) and global_head_dim > 0:
+        out["full_attn_head_dim"] = global_head_dim
+
+    first_dense = text_config.get("first_k_dense_replace")
+    if isinstance(first_dense, int) and first_dense > 0:
+        out["first_k_dense_layers"] = first_dense
+    return out
+
+
+def _declared_quant_bits(config: dict) -> int | None:
+    """Weight width the quantization config states, if it states a single one."""
+    quant = config.get("quantization_config")
+    if not isinstance(quant, dict):
+        return None
+    groups = quant.get("config_groups")
+    if isinstance(groups, dict) and groups:
+        widths = {
+            int((g or {}).get("weights", {}).get("num_bits") or 0) for g in groups.values()
+        }
+        widths.discard(0)
+        return widths.pop() if len(widths) == 1 else None
+    bits = quant.get("bits") or quant.get("w_bit")
+    return int(bits) if isinstance(bits, (int, float)) and bits else None
 
 
 def _detect_quantization(
@@ -603,6 +996,8 @@ def discover_model(
             text_config.get("tie_word_embeddings", config.get("tie_word_embeddings", False))
         ),
         **_detect_moe(text_config),
+        **_detect_attention_layout(text_config),
+        quant_bits=_declared_quant_bits(config),
         weight_bytes_on_disk=total_bytes,
         safetensors_files=files,
         max_position_embeddings=text_config.get("max_position_embeddings"),
@@ -625,6 +1020,29 @@ def discover_model(
         keys = _safetensors_keys(directory, files)
         if keys:
             model.stores_lm_head = any(k.endswith("lm_head.weight") for k in keys)
+        model.weight_bytes_by_role = _tensor_bytes_by_role(directory, files)
+
+    if model.is_mla:
+        model.notes.append(
+            f"Multi-head latent attention (kv_lora_rank {model.kv_lora_rank}, rope "
+            f"{model.qk_rope_head_dim}). config head_dim={model.head_dim} does not apply to "
+            "it. transformers caches MLA layers as expanded per-head K/V, not as the latent, "
+            "so the measured cache is that size; the latent an MLA-native engine would hold "
+            "is reported alongside it."
+        )
+    if model.linear_attn_layers:
+        layout = model.attention_layout()
+        note = (
+            f"Hybrid attention: {layout['linear']} linear-attention layers with a fixed-size "
+            f"recurrent state, {layout['full']} full-attention layers with a growing cache"
+            + (f", {layout['sliding']} sliding-window" if layout["sliding"] else "")
+            + (f", {layout['none']} MLP/MoE-only with no cache" if layout["none"] else "")
+            + "."
+        )
+        if model.linear_attn_kind != "kda":
+            note += (" The recurrent-state size is the documented shape for this layer type "
+                     "and has not been checked against a measured cache.")
+        model.notes.append(note)
 
     if model.is_moe:
         ratio = model.expert_activation_ratio or 0

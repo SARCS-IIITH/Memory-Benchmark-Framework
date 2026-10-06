@@ -13,11 +13,22 @@ about memory.
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from typing import Any
 
+from .. import compat
 from ..config import ModelConfig, WorkloadConfig
 from .base import Backend, GenerationState, register
+
+
+def _read_config(path: str) -> dict:
+    """The checkpoint's config.json, or an empty dict when it cannot be read."""
+    try:
+        return json.loads((Path(path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 def _torch_dtype(name: str):
@@ -46,6 +57,15 @@ class HFTransformersBackend(Backend):
         #: None until resolved; "" means this model accepts no such keyword.
         self._logits_kwarg: str | None = None
         self._prefill_logits_full_vocab: bool = False
+        #: Runtime adapters applied for remote code written against an older transformers.
+        self._compat_shims: list[str] = []
+        self._compat_cache_classes: list[str] = []
+        self._attn_impl_replaced: str | None = None
+        #: Whether the model builds its own cache (hybrid models) rather than taking ours.
+        self._model_owns_cache: bool = False
+        self._fp8_optimized: bool = False
+        #: Decoding-state bytes by kind, from the most recent measurement.
+        self._cache_breakdown: dict[str, int] = {}
 
     # ---- lifecycle --------------------------------------------------------------------
 
@@ -59,6 +79,12 @@ class HFTransformersBackend(Backend):
         # the ones being benchmarked.
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+        # Remote modelling and tokenizer code fails at import time when it reaches for a
+        # symbol the installed transformers has moved, so the shims go in before either
+        # is loaded. They only restore old names; they change nothing a model computes.
+        if cfg.trust_remote_code:
+            self._compat_shims = compat.apply_remote_code_shims()
 
         tokenizer_path = cfg.tokenizer_path or cfg.path
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -79,6 +105,19 @@ class HFTransformersBackend(Backend):
         if cfg.device_map:
             kwargs["device_map"] = cfg.device_map
 
+        # An FP8 compressed-tensors checkpoint is only FP8 at runtime on the optimised path.
+        # Left to the default, transformers keeps the weights packed until the first forward
+        # pass and then unpacks them to bf16 -- doubling the resident footprint and turning
+        # every later measurement into one of a bf16 model. The optimised path keeps them
+        # in FP8 and runs real FP8 matmuls; transformers itself falls back, with a warning,
+        # on a GPU below compute capability 8.9.
+        if compat.is_fp8_compressed_tensors(_read_config(cfg.path)):
+            from transformers.utils.quantization_config import CompressedTensorsConfig
+
+            kwargs["quantization_config"] = CompressedTensorsConfig(use_optimized_inference=True)
+            kwargs.pop("dtype", None)
+            self._fp8_optimized = True
+
         try:
             self.model = AutoModelForCausalLM.from_pretrained(cfg.path, **kwargs)
         except (TypeError, ValueError) as exc:
@@ -97,6 +136,11 @@ class HFTransformersBackend(Backend):
         if not cfg.device_map:
             self.model = self.model.to(self.device)
         self.model.eval()
+
+        if cfg.trust_remote_code:
+            self._compat_cache_classes = compat.adapt_model_cache_api(self.model)
+            self._attn_impl_replaced = compat.use_sdpa_if_flash_attn_missing(self.model)
+        self._model_owns_cache = compat.model_manages_own_cache(self.model)
 
         self._attn_impl_used = getattr(self.model.config, "_attn_implementation", "") or ""
         param = next(self.model.parameters(), None)
@@ -154,7 +198,17 @@ class HFTransformersBackend(Backend):
     # ---- inference --------------------------------------------------------------------
 
     def _new_cache(self):
-        """Create a fresh KV cache, tolerating the several APIs transformers has used."""
+        """Create a fresh KV cache, tolerating the several APIs transformers has used.
+
+        Returns ``None`` for a model that owns its cache. A hybrid model's cache holds more
+        than keys and values -- Kimi-Linear's carries a recurrent and a convolution state per
+        linear-attention layer -- and the model builds it when given ``None``, while a
+        generic ``DynamicCache`` has no slot for that state and fails the model's own type
+        check. The class actually used is read back from the prefill output.
+        """
+        if self._model_owns_cache:
+            self._cache_class_used = "model-managed"
+            return None
         try:
             from transformers import DynamicCache
 
@@ -241,6 +295,8 @@ class HFTransformersBackend(Backend):
             position=inputs["input_ids"].shape[1],
             generated_tokens=[next_token],
         )
+        if state.cache is not None:
+            self._cache_class_used = type(state.cache).__name__
         state.kv_bytes = self._measure_kv_bytes(state.cache)
         return state
 
@@ -269,45 +325,65 @@ class HFTransformersBackend(Backend):
 
     # ---- introspection ----------------------------------------------------------------
 
+    #: Cache attributes by the kind of decoding state they hold. Keys and values grow with
+    #: context; a linear-attention or state-space layer's recurrent and convolution state is
+    #: a fixed size, but is read and rewritten on every decode step all the same -- which is
+    #: why it belongs in the per-step traffic expectation alongside the KV cache.
+    _CACHE_STATE_ATTRS: dict[str, tuple[str, ...]] = {
+        "kv": ("keys", "values", "key_cache", "value_cache"),
+        "recurrent_state": ("recurrent_states", "ssm_states"),
+        "conv_state": ("conv_states",),
+    }
+
     def _measure_kv_bytes(self, cache: Any) -> int | None:
-        """Sum the real KV-cache tensors.
+        """Sum the real decoding-state tensors: the KV cache plus any recurrent state.
 
         Preferred over the analytic estimate because it captures what the implementation
         actually allocated -- padding, preallocation, and quantized cache dtypes included.
         Cache internals have moved around across transformers versions, so several shapes
         are tried and ``None`` is returned rather than a wrong number.
+
+        A hybrid model's cache is more than keys and values: Kimi-Linear's 20 KDA layers each
+        carry a 32x128x128 fp32 recurrent state, ~40 MiB in all, that a decode step reads and
+        rewrites. Counting keys and values alone would leave it out of the expectation the
+        measured traffic is checked against. The split by kind is kept for the manifest.
         """
         if cache is None:
             return None
         try:
-            import torch
-
-            total = 0
-            layers = getattr(cache, "layers", None)
-            if layers is not None:
-                for layer in layers:
-                    for attr in ("keys", "values", "key_cache", "value_cache"):
-                        tensor = getattr(layer, attr, None)
-                        if isinstance(tensor, torch.Tensor):
-                            total += tensor.numel() * tensor.element_size()
-                if total:
-                    return total
-
-            for attr in ("key_cache", "value_cache"):
-                for tensor in getattr(cache, attr, []) or []:
-                    if isinstance(tensor, torch.Tensor):
-                        total += tensor.numel() * tensor.element_size()
-            if total:
-                return total
-
-            if isinstance(cache, (tuple, list)):
-                for layer in cache:
-                    for tensor in layer:
-                        if isinstance(tensor, torch.Tensor):
-                            total += tensor.numel() * tensor.element_size()
-            return total or None
+            breakdown = self._cache_state_breakdown(cache)
         except Exception:                                        # noqa: BLE001
             return None
+        self._cache_breakdown = breakdown
+        return sum(breakdown.values()) or None
+
+    def _cache_state_breakdown(self, cache: Any) -> dict[str, int]:
+        import torch
+
+        seen: set[tuple[int, int, str]] = set()
+        totals = {kind: 0 for kind in self._CACHE_STATE_ATTRS}
+
+        def add(kind: str, value: Any) -> None:
+            # Tensors are deduplicated by storage, since one cache object can expose the
+            # same tensor under two names (a layer list and a flat per-attribute list).
+            if isinstance(value, torch.Tensor):
+                key = (value.data_ptr(), value.numel(), str(value.dtype))
+                if value.numel() and key not in seen:
+                    seen.add(key)
+                    totals[kind] += value.numel() * value.element_size()
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    add(kind, item)
+
+        holders = [cache, *(getattr(cache, "layers", None) or [])]
+        for holder in holders:
+            for kind, attrs in self._CACHE_STATE_ATTRS.items():
+                for attr in attrs:
+                    add(kind, getattr(holder, attr, None))
+
+        if not any(totals.values()) and isinstance(cache, (tuple, list)):
+            add("kv", cache)                                     # legacy tuple-of-tuples
+        return {kind: n for kind, n in totals.items() if n}
 
     def describe(self) -> dict:
         info: dict[str, Any] = {
@@ -324,9 +400,25 @@ class HFTransformersBackend(Backend):
             # Recording it is what lets a high expected-versus-measured ratio be attributed
             # rather than guessed at.
             "kv_cache_class": self._cache_class_used,
+            "cache_managed_by_model": self._model_owns_cache,
+            # Bytes by kind (kv / recurrent_state / conv_state) at the last measurement --
+            # the end of generation. A hybrid model's recurrent state does not grow with
+            # context, so this is what separates it from the KV cache in the report.
+            "cache_state_bytes": dict(self._cache_breakdown) or None,
+            "fp8_optimized_inference": self._fp8_optimized,
             "prefill_logits_to_keep_kwarg": self._logits_kwarg or None,
             "prefill_computed_full_vocab_logits": self._prefill_logits_full_vocab,
         }
+        if self._compat_shims or self._compat_cache_classes:
+            info["compat_adapters"] = {
+                "import_shims": self._compat_shims,
+                "cache_classes_adapted": self._compat_cache_classes,
+            }
+        if self._attn_impl_replaced:
+            info["attn_warning"] = (
+                f"the model forces {self._attn_impl_replaced}, which is not installed; its "
+                "attention layers were switched to sdpa"
+            )
         if self._load_error:
             info["load_warning"] = self._load_error
         if self._prefill_logits_full_vocab:

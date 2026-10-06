@@ -22,6 +22,14 @@ defaults:
 models:
 
   # ---- dense ------------------------------------------------------------------------
+  qwen3-0.6b:
+    repo: Qwen/Qwen3-0.6B
+    label: Qwen3 0.6B
+    family: Qwen3
+    class: dense
+    params: 0.6e9
+    note: Smoke-test model -- small enough that a full run takes minutes.
+
   qwen3-4b:
     repo: Qwen/Qwen3-4B
     label: Qwen3 4B
@@ -72,6 +80,22 @@ models:
     params: 35e9
     active_params: 3e9
     note: Largest checkpoint in the suite at ~72 GB; the tightest fit on a 128 GB pool.
+
+  kimi-linear-48b-fp8:
+    repo: nm-testing/Kimi-Linear-48B-A3B-Instruct-FP8-DYNAMIC
+    label: Kimi Linear 48B-A3B (FP8)
+    family: KimiLinear
+    class: moe
+    params: 48e9
+    active_params: 3e9
+    note: >
+      Hybrid attention: 20 Kimi Delta Attention (linear, fixed-size recurrent state) layers
+      and 7 MLA layers, over 256 experts with top-8 plus one shared. FP8 weights (per-channel,
+      dynamic per-token activations, compressed-tensors), 50 GB on disk. Must be loaded with
+      use_optimized_inference=True or transformers unpacks it to ~98 GB of bf16. Custom
+      modelling code written for transformers 4.57: needs the shim in
+      experiments/kimi-linear-compat, fla-core==0.4.0, and SDPA in place of the hard-coded
+      flash_attention_2. HF caches its MLA layers expanded, not as the compressed latent.
 
   nano-omni-30b:
     repo: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16

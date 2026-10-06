@@ -46,7 +46,7 @@ from .base import Backend, GenerationState, register
 
 _SETUP_HINT = (
     "The TensorRT-LLM backend is not implemented.\n"
-    "  Environment:  bash setup/setup_trtllm_env.sh   (creates envs/samarthamp-trtllm)\n"
+    "  Environment:  bash setup/setup_trtllm_env.sh   (creates ~/envs/nsbench-trtllm)\n"
     "  Status:       aarch64 wheels are release-candidate only (tensorrt_llm 1.3.0rc*),\n"
     "                sm_121 support unverified, and the NGC container path needs docker\n"
     "                access this user does not have.\n"

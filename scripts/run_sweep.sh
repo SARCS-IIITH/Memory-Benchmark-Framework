@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-ENV_DIR="${ENV_DIR:-/home/sarcs/envs/samarthamp}"
+ENV_DIR="${ENV_DIR:-${HOME}/envs/nsbench}"
 NSBENCH="${ENV_DIR}/bin/nsbench"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO}"
