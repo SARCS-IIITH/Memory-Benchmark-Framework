@@ -267,7 +267,8 @@ Per prefill. The 128-token row comes from the batch-1 decode runs (their prompt 
   - Below **~292 tokens per sequence** the fixed KDA state is the larger part of the cache: ~2/3 of it in the 160-token decode sweep.
   - At 16k tokens MLA K/V is 98% of the cache. All-MLA attention would have needed ~9 GB there instead of 2.4 GB.
   - Full table: `runs/moe-queue/results.md`, "KV cache and recurrent state".
-- **But the cache costs ~2.9× its size in traffic per step** (+7.0 GB for a 2.4 GB cache). *Hypothesis, not verified:* transformers' `DynamicCache` concatenates on every update, so each step reads the old cache, writes a new copy and then attention reads it: ≈ 3 × 2.4 GB.
+- **But the cache costs ~2.9× its size in traffic per step** (+7.0 GB for a 2.4 GB cache). The cache in use is Kimi's own `KimiDynamicCache`, and its `update()` **does** rebuild each layer's K and V with `torch.cat` on every token (confirmed in `modeling_kimi.py`, 5.7). *Still a hypothesis:* that this explains the ~3×: each step reads the old cache, writes a new copy, then attention reads it, ≈ 3 × 2.4 GB. The traffic split itself was not measured.
+- **The MLA layers run as standard multi-head attention**, which is why the cache is the expanded 143 KB/token and not MLA's 8 KB/token. See 5.7.
 - **The time cost is modest** (+34 ms/step), because decode is launch-bound (5.5).
 
 ### 5.4 Router skew, and the prefill anomaly it causes
@@ -305,8 +306,76 @@ That is why natural uses about half the experts the formula predicts (5.1, 5.2).
 4. **Large prefills:** L2 GB do not rank routing modes reliably (5.4). Use expert counts and time.
 5. **Forced routing makes the generated text meaningless.** Only the traffic is real.
 6. **Stall data (ncu tier 2) exists for 8 of the 22 runs only**, and its 60-launch sample covers only the first ~4–5 linear layers: it never reached the routed experts. **No routing conclusion in this section depends on ncu**; the ncu-based points (5.4 mechanism, 5.5 GEMM ratio) are marked ⚠️. Which runs and why: `runs/moe-queue/findings.md`, "ncu coverage".
-7. **The first long-context attempt, with ncu, crashed the DGX by exhausting memory.** The re-run without ncu is the one reported here. Never run ncu on Kimi long-context prefill on this machine.
+7. **The first long-context attempt, with ncu, crashed the DGX by exhausting memory.** The re-run without ncu is the one reported here. Never run ncu on Kimi long-context prefill on this machine. Why memory grew so far (~100 GB in one process): 5.7.
 8. **Batch-32 ncu runs were collected under memory pressure** (~190 driver allocation failures, no data lost). Timing and L2 come from separate processes and are unaffected.
+
+
+### 5.7 MLA runs as standard attention, and why memory reached ~100 GB
+
+*Added 2026-10-10. Prompted by an `nvidia-smi` screenshot taken during the queue: at **14:20:12 on 2026-10-06**, one `nsbench` Python process (PID **330905**) was using **94,977 MiB (~99.6 GB)** of GPU memory.*
+
+#### MLA layers are expanded and run as standard multi-head attention
+
+Kimi-Linear's 7 MLA layers are designed to cache a small compressed form of each token's keys and values. In the transformers code that ran here (`modeling_kimi.py`, `KimiMLAAttention.forward`), each MLA layer:
+
+1. computes the compressed form, `compressed_kv`: 512 latent values + 64 position (RoPE) values per token;
+2. **immediately expands it** with `kv_b_proj` into full keys and values for all 32 heads (`num_key_value_heads = 32`);
+3. **stores the expanded keys and values** in the cache (`past_key_values.update(key_states, value_states, …)`);
+4. runs ordinary attention over them (`sdpa`, since `flash_attention_2` isn't installed).
+
+So at run time **the MLA layers behave exactly like standard multi-head attention (MHA)**. The compressed form only exists for a moment inside each layer. The 64 position values per token are also stored 32 times, once per head, although they are the same for every head.
+
+| Cached per token, all 7 MLA layers | Bytes | At 16,416 tokens (run 22: 16,384 prompt + 32 generated) |
+|---|---|---|
+| **Expanded K + V (what ran)**: 32 heads × (192 K + 128 V) × 2 B × 7 | **143,360 B** | **2.353 GB**, measured exactly: `cache_state_bytes.kv = 2,353,397,760` |
+| Compressed latent (what MLA is designed to cache): (512 + 64) × 2 B × 7 | 8,064 B | 0.132 GB |
+
+The expanded cache is **17.8× larger** than MLA intends. On top of that, the cache class in use (`KimiDynamicCache`, recorded in the run manifest) grows each layer's K and V with `torch.cat` on **every token**, which builds a new, larger copy of the whole layer cache each step. That is the likely source of the extra decode traffic at long context (5.3).
+
+An inference engine that implements MLA properly caches the compressed form and doesn't copy the cache on every token. **llama.cpp does this for Kimi-Linear** (confirmed from its code, 2026-10-10, not yet from a run): its converter (`conversion/kimi_linear.py`) splits `kv_b_proj` into `k_b_proj` and `v_b_proj`, and its runtime (`src/models/kimi-linear.cpp`, "MLA KV cache enabled" branch) folds the key expansion into the query (`q_nope_absorbed`), caches only the 512 compressed + 64 position values per token as one key/value shared by all 32 query heads, and applies `v_b_proj` after attention. That is 8,064 B/token instead of 143,360 B, ~0.13 GB instead of 2.35 GB at 16k tokens. An older GGUF without the split takes a fallback branch that expands like transformers. To confirm on a run: the load log's "KV buffer size" line.
+
+#### Which run the ~100 GB process was
+
+| Evidence | What it shows |
+|---|---|
+| `runs/moe-queue/queue.log`: `13:44:21 START 22/22 moe-longctx-natural-p16384 ncu=ncu` | At 14:20 the queue was on run 22, the 16,384-token long-context run, **with ncu on** |
+| `runs/20261006T081421Z__…__moe-longctx-natural-p16384__hf__moe/logs/ncu_tier2_prefill.stdout.log`, first line: `==PROF== Connected to process 330905` | **PID 330905 was the process being profiled by ncu tier 2 during the 16k-token prefill** |
+| Same log, last line: `Profiling "unrolled_elementwise_kernel": 0%` | ncu never finished profiling even its first kernel |
+
+So the ~100 GB was **run 22's ncu stage**: the stage that later ran the DGX out of memory (caveat 7 in 5.6; progress.md, run 22). The other 21 runs used short contexts, and their processes stayed at ~50–58 GB.
+
+#### Why that process used so much memory
+
+The ~100 GB is four things stacked on top of each other:
+
+| Part | Size | Where the number comes from |
+|---|---|---|
+| **1. FP8 weights** | **~50 GB** | Measured in every Kimi run: "Model weights resident" 50.01 GB |
+| **2. Working memory for a 16,384-token prefill** | **~8.8 GB** above the weights | Same workload without any profiler (re-run `runs/20261006T103757Z__…__moe-longctx-natural-p16384__hf__moe`): PyTorch peak allocated **58.82 GB** |
+| …of which the **expanded MLA cache** | 2.35 GB (compressed would be 0.13 GB) | `cache_state_bytes.kv`, above |
+| …of which KDA recurrent + conv state | 0.04 GB | `cache_state_bytes`, flat at any context length |
+| …the rest: prefill activations for 16k tokens | ~6.4 GB | Hidden states, MoE intermediates and attention inputs for 16,384 tokens at once. In the short runs this is ~0–2 GB. |
+| **3. PyTorch holding freed memory for reuse** | **~6.9 GB** | Same re-run: peak *reserved* 65.70 GB vs peak *allocated* 58.82 GB. PyTorch's caching allocator keeps freed blocks instead of returning them, so nvidia-smi still counts them. The nsys allocation timeline agrees: 65.71 GB. |
+| **4. ncu's kernel replay** | **~34 GB** | *Inferred, not measured directly:* 99.6 GB (nvidia-smi) − 65.7 GB (the same workload without ncu) |
+
+**Why ncu adds so much.** ncu measures a kernel by running it ~15 times and reading different counters each time. For each run to give the same result, it saves a copy of the memory the kernel may change before the first run, and restores it before each later one. Those copies are made inside the profiled process, so nvidia-smi counts them against it. In a 16k-token prefill the tensors a kernel touches are large, so the saved copies are large too. How much ncu saved was not logged; ~34 GB is the difference between the two measurements above.
+
+**Why it crashed the machine instead of just failing.** GB10 has no separate GPU memory: the CPU and GPU share one ~119 GB pool. ~100 GB in this one process, plus the operating system, the file cache and other users' processes, exhausted it. The kernel's out-of-memory killer then couldn't free anything useful. ncu marks the profiled process as unkillable (`oom_score_adj -1000`), and its memory is GPU allocations rather than ordinary process memory, so the killer only removed a small desktop process. The machine thrashed for ~1.5 h before it went down (progress.md, run 22).
+
+#### So was MLA expansion the reason?
+
+**Only a small part: ~2.2 GB of the ~100 GB.** The memory grew because of, in order of size:
+
+1. **The weights: ~50 GB**, fixed for this model in FP8.
+2. **ncu's replay copies: ~34 GB** (inferred), only present while ncu profiles, and large because the prompt was large.
+3. **The 16k-token prompt: ~8.8 GB** of prefill working memory, including the 2.35 GB expanded MLA cache (2.2 GB more than the compressed form would need).
+4. **PyTorch's held blocks: ~6.9 GB.**
+
+#### What to take from this
+
+- **Never run ncu on a long-context prefill of a large model on this machine**, whichever engine runs it. The replay copies scale with the data each kernel touches. Long-context runs: `--skip-ncu` plus the memory guard in `scripts/rerun_moe_longctx.sh`.
+- **The MLA expansion is a property of HF transformers' Kimi code, not of the model.** Reports already show both cache sizes (expanded and compressed). An engine that keeps the compressed form would cut the 16k-token cache from 2.35 GB to 0.13 GB and remove the per-token `torch.cat` copy, but would not change parts 1, 2 (activations) or 4.
+- **llama.cpp (see [09-llamacpp-comparison.md](09-llamacpp-comparison.md) section 9.6)** would change parts 2 and 3: a compressed MLA cache (confirmed from its code, above), and memory reserved once at load instead of PyTorch's caching allocator. It would not change ncu's replay copies (part 4), so the rule above still applies.
 
 ---
 

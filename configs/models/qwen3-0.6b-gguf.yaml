@@ -1,0 +1,66 @@
+name: Qwen3-0.6B
+path: /home/imc/ai-models/gguf/Qwen3-0.6B-bf16.gguf
+dtype: bfloat16
+attn_implementation: sdpa
+trust_remote_code: false
+task: text-generation
+device_map: null
+tokenizer_path: /opt/ai-models/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+max_position_embeddings: 40960
+architecture: Qwen3ForCausalLM
+model_type: qwen3
+quantization: null
+kv_quantization: null
+num_layers: 28
+hidden_size: 1024
+num_attention_heads: 16
+num_key_value_heads: 8
+head_dim: 128
+vocab_size: 151936
+intermediate_size: 3072
+tie_word_embeddings: true
+num_experts: 0
+num_experts_per_token: 0
+num_shared_experts: 0
+num_moe_layers: 0
+kv_lora_rank: 0
+q_lora_rank: 0
+qk_rope_head_dim: 0
+qk_nope_head_dim: 0
+v_head_dim: 0
+linear_attn_layers: []
+sliding_attn_layers: []
+sliding_window: 0
+linear_attn_num_heads: 0
+linear_attn_key_head_dim: 0
+linear_attn_value_head_dim: 0
+linear_attn_conv_kernel: 0
+linear_attn_conv_channels: 0
+linear_attn_kind: ''
+linear_attn_state_dtype_bytes: 4
+no_cache_layers: []
+full_attn_head_dim: 0
+first_k_dense_layers: 0
+weight_bytes_by_role:
+  lm_head: 311164928
+  embedding: 311164928
+  other: 880934912
+quant_bits: null
+param_count: 751650164
+weight_bytes_on_disk: 1509347168
+safetensors_files: []
+notes:
+- GGUF copy of configs/models/qwen3-0.6b.yaml for the llamacpp backend (docs/09). Converted
+  from the same safetensors with llama.cpp's convert_hf_to_gguf.py --outtype bf16 at llama.cpp
+  commit 0c1e57098bba43ac29e6e3b677cdceebdd22334f. Every architecture field is copied unchanged.
+- tokenizer_path points at the original Hugging Face snapshot so the synthetic prompt uses
+  the same vocabulary bound, and therefore the same token ids, as the hf backend.
+- The GGUF stores both token_embd.weight and output.weight (311 MB each), so llama.cpp holds
+  about 1.50 GB resident, not 1.19 GB. A decode step's reads are unchanged (all of the output
+  matrix plus one embedding row).
+- This checkpoint declares tied word embeddings and stores lm_head.weight anyway,
+  so the on-disk size counts the embedding matrix twice. The loaded model holds one
+  copy, so its resident size reads about 311 MB below the on-disk figure. That is
+  expected, not a discrepancy -- and the resident figure is the one a decode step's
+  traffic must be compared against, since the step reads that matrix once.
+stores_lm_head: true

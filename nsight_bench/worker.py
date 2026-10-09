@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # Imported here rather than at module scope so --help works without torch present.
-    from .backends import hf_transformers, trtllm  # noqa: F401  (registers backends)
+    from .backends import hf_transformers, llamacpp, trtllm  # noqa: F401  (registers backends)
     from .backends.base import get_backend
     from .config import RunConfig
     from .instrumentation import memory as mem

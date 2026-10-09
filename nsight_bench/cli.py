@@ -572,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", help="Model config YAML (from 'nsbench discover')")
     p.add_argument("--model-path", help="Checkpoint directory, discovered on the fly")
     p.add_argument("--name", help="Model name when using --model-path")
-    p.add_argument("--backend", default="hf", help="hf | trtllm")
+    p.add_argument("--backend", default="hf", help="hf | llamacpp | trtllm")
     p.add_argument("--workload", help="Workload config YAML")
     p.add_argument("--workload-name", help="Name for this workload in the run id")
     p.add_argument("--prompt-tokens", type=int)
