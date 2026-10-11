@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from .. import compat
 from ..config import ModelConfig, WorkloadConfig
 from .base import Backend, GenerationState, register
 
@@ -156,6 +157,8 @@ class LlamaCppBackend(Backend):
                 "the llamacpp backend needs tokenizer_path (the original Hugging Face snapshot) "
                 "to build the same prompt token ids as the hf backend"
             )
+        if self.model_config.trust_remote_code:
+            compat.apply_remote_code_shims()
         return AutoTokenizer.from_pretrained(path, trust_remote_code=self.model_config.trust_remote_code)
 
     # ---- inference --------------------------------------------------------------------
