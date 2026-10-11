@@ -31,6 +31,8 @@ ncu:
   nvtx_scope: nsbench.decode_step
   clock_control: base
   cache_control: all
-  replay_mode: kernel
+  # auto: application replay for the llamacpp backend (no per-kernel memory copy), kernel
+  # replay otherwise. See NcuConfig.replay_mode in nsight_bench/config.py.
+  replay_mode: auto
   max_kernels: 4000
   timeout_s: 7200

@@ -21,6 +21,7 @@ from ..analysis.deep_dive import STALL_REASONS
 from ..metrics import DEVICE_LEVELS, Level
 from .format_utils import (
     NOT_MEASURED,
+    cache_footprint_rows,
     fmt_bandwidth,
     fmt_bytes,
     fmt_count,
@@ -573,19 +574,8 @@ def _footprint(analysis: RunAnalysis) -> str:
          "allocations made inside the traced region only"],
         ["Model weights resident", fmt_bytes(footprint.model_weight_bytes_resident),
          "parameters plus buffers, as loaded"],
-        ["KV cache" + (" + recurrent state" if footprint.cache_state_bytes.get("recurrent_state")
-                       else ""),
-         fmt_bytes(footprint.kv_cache_bytes),
-         "measured from the live cache tensors"
-         + (" -- " + ", ".join(f"{k} {fmt_bytes(v)}" for k, v in footprint.cache_state_bytes.items())
-            if len(footprint.cache_state_bytes) > 1 else "")],
     ]
-    if footprint.mla_latent_kv_bytes:
-        rows.append([
-            "MLA latent equivalent", fmt_bytes(footprint.mla_latent_kv_bytes),
-            "what an MLA-native engine would cache; transformers holds the expanded "
-            f"per-head K/V instead ({fmt_bytes(footprint.mla_expanded_kv_bytes)})",
-        ])
+    rows.extend(cache_footprint_rows(footprint))
     if footprint.host_available_delta:
         rows.append([
             "Host pool drawn down by load",
@@ -798,10 +788,19 @@ def _methodology(analysis: RunAnalysis) -> str:
         "Bytes past L2 come from `lts__t_sectors_aperture_sysmem_lookup_miss x 32 B`, with "
         "the device and peer aperture counters carried as sentinels that must read zero."
     )
-    lines.append(
-        "- **Profiled durations are not performance.** Nsight Compute replays each kernel "
-        "many times. Only the baseline section reports real timing."
-    )
+    if analysis.ncu_replay_mode == "application":
+        lines.append(
+            "- **Profiled durations are not performance.** Nsight Compute used application "
+            "replay: the whole workload was re-run once per counter pass, each kernel "
+            "serialised with caches flushed before it, and the passes matched up by kernel "
+            "name and grid size. Only the baseline section reports real timing. Byte counts "
+            "agree with kernel replay to within 0.1%; per-kernel durations do not."
+        )
+    else:
+        lines.append(
+            "- **Profiled durations are not performance.** Nsight Compute replays each kernel "
+            "many times. Only the baseline section reports real timing."
+        )
     lines.append(
         "- **One decode step is profiled, not all of them.** A decode step's kernel mix does "
         "not change between tokens, so one step gives full kernel coverage at a fraction of "

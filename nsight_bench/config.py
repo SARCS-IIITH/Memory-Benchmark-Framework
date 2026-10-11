@@ -496,7 +496,8 @@ class ModelConfig:
         return bool(self.tie_word_embeddings and self.stores_lm_head)
 
     def kv_cache_bytes(
-        self, seq_len: int, batch_size: int = 1, kv_dtype_bytes: int | None = None
+        self, seq_len: int, batch_size: int = 1, kv_dtype_bytes: int | None = None,
+        engine: str = "transformers",
     ) -> int:
         """Analytic decoding-state size for a given context length.
 
@@ -506,15 +507,18 @@ class ModelConfig:
         attention heads would overstate this several-fold on modern models.
 
         Hybrid and MLA models are summed per layer kind by :meth:`kv_cache_breakdown`, which
-        includes any linear-attention recurrent state. MLA is sized **as transformers caches
-        it** (expanded per-head K and V), because that is what the measured cache holds; see
-        :meth:`mla_latent_kv_bytes` for the compressed size an MLA-native engine would store.
+        includes any linear-attention recurrent state. The layout follows ``engine`` (see
+        there): by default MLA is sized **as transformers caches it** (expanded per-head K
+        and V), because that is what the hf backend's measured cache holds; llama.cpp holds
+        the latent instead. :meth:`mla_latent_kv_bytes` gives the latent size on its own.
         """
-        return sum(self.kv_cache_breakdown(seq_len, batch_size, kv_dtype_bytes).values())
+        return sum(
+            self.kv_cache_breakdown(seq_len, batch_size, kv_dtype_bytes, engine=engine).values()
+        )
 
     def kv_cache_breakdown(
         self, seq_len: int, batch_size: int = 1, kv_dtype_bytes: int | None = None,
-        mla_latent: bool = False,
+        mla_latent: bool = False, engine: str = "transformers",
     ) -> dict[str, int]:
         """Decoding-state bytes by kind: ``kv``, ``recurrent_state``, ``conv_state``.
 
@@ -527,9 +531,29 @@ class ModelConfig:
           value_dim`` and a short-convolution window, regardless of context. For KDA this
           was checked against a live Kimi-Linear cache (exact match at 84 tokens);
           for Gated DeltaNet it is the documented shape, not yet measured.
+
+        ``engine`` selects whose cache layout is sized, since the same model is cached
+        differently by different engines:
+
+        * ``"transformers"`` (default): as above -- MLA expanded, K/V in the model dtype,
+          the conv window as ``kernel`` inputs in bf16.
+        * ``"llama.cpp"``: MLA as the latent, K only, f16 -- llama.cpp folds ``kv_b_proj``
+          into the query and the output, and V is a view of the cached latent. That needs
+          a GGUF with ``kv_b_proj`` split into ``attn_k_b``/``attn_v_b``, which every
+          current converter writes; a legacy GGUF without the split is cached expanded,
+          which this does not model. Other attention K/V are f16, and the conv window is
+          ``kernel - 1`` inputs in f32. Checked against llama.cpp's own allocation log for
+          Kimi-Linear Q8_0 (2026-10-12): K 1.97 MiB at 256 cells and 127.97 MiB at 16,640
+          (7 layers, no V), S 40.00 MiB, R 2.81 MiB -- all exact. llama.cpp also rounds its
+          cell count up to a multiple of 256; that padding is not included here.
         """
+        if engine not in CACHE_ENGINES:
+            raise ValueError(f"unknown cache engine {engine!r}; expected one of {CACHE_ENGINES}")
+        llama_cpp = engine == "llama.cpp"
+        if llama_cpp:
+            mla_latent = True
         if kv_dtype_bytes is None:
-            kv_dtype_bytes = self.kv_dtype_bytes
+            kv_dtype_bytes = 2 if llama_cpp else self.kv_dtype_bytes
         layout = self.attention_layout()
         elements = layout["full"] * seq_len * self._kv_elements_per_token(mla_latent)
         if layout["sliding"]:
@@ -548,12 +572,16 @@ class ModelConfig:
             value_dim = self.linear_attn_value_head_dim or key_dim
             breakdown["recurrent_state"] = (
                 layout["linear"] * batch_size * heads * key_dim * value_dim
-                * self.linear_attn_state_dtype_bytes
+                * (4 if llama_cpp else self.linear_attn_state_dtype_bytes)
             )
             if self.linear_attn_conv_kernel and self.linear_attn_conv_channels:
+                window, dtype_bytes = (
+                    (self.linear_attn_conv_kernel - 1, 4) if llama_cpp
+                    else (self.linear_attn_conv_kernel, 2)
+                )
                 breakdown["conv_state"] = (
                     layout["linear"] * batch_size * self.linear_attn_conv_channels
-                    * self.linear_attn_conv_kernel * 2
+                    * window * dtype_bytes
                 )
         return {k: v for k, v in breakdown.items() if v}
 
@@ -1217,6 +1245,20 @@ class NsysConfig:
     timeout_s: int = 3600
 
 
+#: Engines whose decoding-cache layout :meth:`ModelConfig.kv_cache_breakdown` can size.
+CACHE_ENGINES = ("transformers", "llama.cpp")
+
+
+def cache_engine_for_backend(backend: str) -> str:
+    """The engine whose cache layout a backend runs: llama.cpp for llamacpp, else transformers."""
+    return "llama.cpp" if backend == "llamacpp" else "transformers"
+
+
+#: Accepted ``ncu.replay_mode`` values. ncu's range modes are left out on purpose: they
+#: report per range, not per kernel, which nothing downstream of the runner can read.
+REPLAY_MODES = ("auto", "kernel", "application")
+
+
 @dataclass
 class NcuConfig:
     """Nsight Compute collection settings."""
@@ -1232,7 +1274,9 @@ class NcuConfig:
     #: tolerable for a dense model (~1,600 launches per decode step) but not for an eager MoE
     #: (Kimi-Linear: ~12,000 per decode step and ~190,000 per prefill, i.e. many hours that
     #: still end truncated at the launch cap). Add 1 back (``tiers: [1, 2]`` or
-    #: ``--tiers 1,2``) whenever the byte totals are wanted.
+    #: ``--tiers 1,2``) whenever the byte totals are wanted. Under application replay
+    #: (:attr:`replay_mode`) its cost is roughly passes x (~15 s + launches x ~27 ms): about
+    #: 30 min for Kimi-Linear through llama.cpp (1,864 + 1,306 launches); measured 2026-10-11, see progress.md.
     tiers: tuple[int, ...] = (2,)
 
     #: Where tier 2+ gets its top-N kernel list: "nsys" (GPU time per kernel from the nsys
@@ -1259,7 +1303,23 @@ class NcuConfig:
     #: off makes L2 hit rates unrepresentative of the real, un-replayed execution.
     cache_control: str = "all"
 
-    replay_mode: str = "kernel"
+    #: How ncu gets several counter passes out of one kernel launch (measured on Kimi-Linear
+    #: 2026-10-11; numbers in progress.md, "ncu application replay test").
+    #:
+    #: * "kernel": ncu's own default. Before a kernel's first pass it saves all GPU memory
+    #:   the kernel *could* access -- every allocation, since it cannot tell which ones the
+    #:   kernel uses -- and restores it between passes. On a 50 GB model that is a ~50 GB
+    #:   copy per kernel: ~7 s each, and the process peaks at about twice the model's size.
+    #: * "application": re-run the whole worker once per pass and match kernels across the
+    #:   runs by name and grid size. Nothing is saved, so memory stays at an unprofiled
+    #:   run's level and the cost becomes passes x one worker run. It needs every run to
+    #:   launch the same kernels in the same order.
+    #: * "auto" (default): "application" for the llamacpp backend, whose launches are fixed
+    #:   by tensor shapes rather than by data (one launch per MoE matmul for all routed
+    #:   experts; checked on 160 differently-routed Kimi decode steps), and "kernel" for
+    #:   everything else. The hf backend loops over used experts on the host, so its
+    #:   launches follow routing and application replay is not safe to assume there.
+    replay_mode: str = "auto"
 
     #: Cap on kernel launches profiled per collection, passed to ncu as --launch-count.
     #:
@@ -1294,6 +1354,16 @@ class NcuConfig:
             raise ValueError(
                 f"ncu rank_source must be nsys or tier1, got {self.rank_source!r}"
             )
+        if self.replay_mode not in REPLAY_MODES:
+            raise ValueError(
+                f"ncu replay_mode must be one of {REPLAY_MODES}, got {self.replay_mode!r}"
+            )
+
+    def resolved_replay_mode(self, backend: str) -> str:
+        """The ``--replay-mode`` ncu is given for ``backend``: "auto" made concrete."""
+        if self.replay_mode != "auto":
+            return self.replay_mode
+        return "application" if backend == "llamacpp" else "kernel"
 
 
 @dataclass

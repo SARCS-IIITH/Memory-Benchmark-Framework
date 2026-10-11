@@ -269,6 +269,8 @@ def _build_run_config(args: argparse.Namespace) -> RunConfig:
         profile_config.ncu.tiers = tuple(int(t) for t in args.tiers.split(","))
     if args.rank_source:
         profile_config.ncu.rank_source = args.rank_source
+    if args.replay_mode:
+        profile_config.ncu.replay_mode = args.replay_mode
 
     return RunConfig(
         model=model,
@@ -298,6 +300,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if 1 not in ncu_cfg.tiers:
         print("             tier 1 off: no byte totals or decode physics check "
               "(--tiers 1,2 to add it)")
+    replay = ncu_cfg.resolved_replay_mode(run_config.backend)
+    print(f"  ncu replay {replay}"
+          + (f"  (auto, {run_config.backend} backend)" if ncu_cfg.replay_mode == "auto" else ""))
     print()
 
     record = BenchmarkOrchestrator(
@@ -590,6 +595,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rank-source", choices=("nsys", "tier1"),
                    help="Where tier 2 gets its top-N kernels: the nsys timeline (default) or "
                         "tier 1's ncu export. Falls back to the other when it has no data")
+    p.add_argument("--replay-mode", choices=("auto", "kernel", "application"),
+                   help="How ncu replays kernels for multi-pass counters. auto (default): "
+                        "application for the llamacpp backend, kernel otherwise. Kernel "
+                        "replay copies all GPU memory per kernel (~2x the model at peak)")
     p.add_argument("--top-n", type=int, help="Kernels to deep-dive in tier 2")
     p.add_argument("--max-kernels", type=int,
                    help="ncu --launch-count cap. Below the phase's real kernel count this "

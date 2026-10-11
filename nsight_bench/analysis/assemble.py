@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .. import stats
 from ..calibration import CalibrationResult
-from ..config import ModelConfig, RunConfig, WorkloadConfig
+from ..config import ModelConfig, RunConfig, WorkloadConfig, cache_engine_for_backend
 from ..metrics import Level
 from ..parsers.ncu_parse import NcuReport, base_identifier, parse_csv
 from ..parsers.nsys_parse import NsysReport, parse_sqlite
@@ -177,6 +177,12 @@ class FootprintAnalysis:
     #: MLA-native engine would hold, at the end-of-generation context.
     mla_expanded_kv_bytes: int | None = None
     mla_latent_kv_bytes: int | None = None
+    #: Whose cache layout the run's engine uses ("transformers" or "llama.cpp"; see
+    #: ModelConfig.kv_cache_breakdown). It decides which of the two MLA sizes was held.
+    cache_engine: str = "transformers"
+    #: The decoding state by kind as the engine lays it out, sized analytically, for
+    #: backends whose cache the harness cannot see (llama.cpp). Empty when it was measured.
+    analytic_cache_state_bytes: dict[str, int] = field(default_factory=dict)
     host_available_delta: int | None = None
     #: True on a part where the GPU and the host share one physical pool, as on GB10. It
     #: changes what ``cuda_peak_used`` means, so it must be known before that figure is
@@ -255,6 +261,8 @@ class FootprintAnalysis:
             "cache_state_bytes": self.cache_state_bytes or None,
             "mla_expanded_kv_bytes": self.mla_expanded_kv_bytes,
             "mla_latent_kv_bytes": self.mla_latent_kv_bytes,
+            "cache_engine": self.cache_engine,
+            "analytic_cache_state_bytes": self.analytic_cache_state_bytes or None,
             "host_available_delta_bytes": self.host_available_delta,
             "process_footprint_bytes": self.process_footprint_bytes(),
             "agreement": self.agreement(),
@@ -337,6 +345,33 @@ class RunAnalysis:
     @property
     def calibration_passed(self) -> bool:
         return bool(self.calibration and self.calibration.passed)
+
+    @property
+    def backend(self) -> str:
+        """The backend that ran: "hf", "llamacpp", ..."""
+        return (self.manifest.get("config") or {}).get("backend") or "hf"
+
+    @property
+    def cache_engine(self) -> str:
+        """Whose decoding-cache layout that backend uses (ModelConfig.kv_cache_breakdown)."""
+        return cache_engine_for_backend(self.backend)
+
+    @property
+    def ncu_replay_mode(self) -> str:
+        """The ncu ``--replay-mode`` this run used: "kernel" or "application".
+
+        Read from what the ncu runner recorded; runs from before it recorded the mode fall
+        back to the profile in the run config, and to "kernel", ncu's default and the only
+        mode the harness used until 2026-10-11.
+        """
+        recorded = (self.manifest.get("ncu") or {}).get("replay_mode")
+        if recorded:
+            return recorded
+        config = self.manifest.get("config") or {}
+        setting = ((config.get("profile") or {}).get("ncu") or {}).get("replay_mode", "kernel")
+        if setting == "auto":
+            return "application" if self.backend == "llamacpp" else "kernel"
+        return setting
 
     @property
     def dram_ceiling_gbps(self) -> float | None:
@@ -825,7 +860,7 @@ def _cross_check(analysis: RunAnalysis) -> None:
         if not kv_bytes and analysis.workload:
             context_len = analysis.workload.prompt_tokens + analysis.workload.generate_tokens
             kv_bytes = analysis.model.kv_cache_bytes(
-                context_len, analysis.workload.batch_size
+                context_len, analysis.workload.batch_size, engine=analysis.cache_engine
             )
         # Which weight figure this uses changes the verdict, so it is recorded rather than
         # left implicit. The resident measurement counts each tensor once, so a checkpoint
@@ -877,7 +912,9 @@ def _cross_check(analysis: RunAnalysis) -> None:
         state_write_bytes = 0
         if model.linear_attn_layers:
             batch = analysis.workload.batch_size if analysis.workload else 1
-            state_write_bytes = model.kv_cache_breakdown(1, batch).get("recurrent_state", 0)
+            state_write_bytes = model.kv_cache_breakdown(
+                1, batch, engine=analysis.cache_engine
+            ).get("recurrent_state", 0)
 
         decode.expectation = check_decode_expectation(
             decode.hierarchy, weight_bytes, kv_bytes, context_len,
@@ -889,8 +926,18 @@ def _cross_check(analysis: RunAnalysis) -> None:
                if use_nsys_l2 else {}),
         )
 
+    # The engine's cache layout, and -- when the backend could not measure the cache, as
+    # with llama.cpp -- its analytic size in that layout, so the footprint is not blank.
+    analysis.footprint.cache_engine = analysis.cache_engine
+    if analysis.model and analysis.workload and not analysis.footprint.kv_cache_bytes:
+        context = analysis.workload.prompt_tokens + analysis.workload.generate_tokens
+        analysis.footprint.analytic_cache_state_bytes = analysis.model.kv_cache_breakdown(
+            context, analysis.workload.batch_size, engine=analysis.cache_engine
+        )
+
     # For MLA, what transformers caches (expanded per-head K/V) is not what MLA is designed
-    # to cache. Record the latent size so the report can put the two side by side.
+    # to cache, while llama.cpp caches the latent. Record both sizes so the report can put
+    # them side by side and say which one this run's engine held.
     if analysis.model and analysis.model.is_mla and analysis.workload:
         context = analysis.workload.prompt_tokens + analysis.workload.generate_tokens
         analysis.footprint.mla_latent_kv_bytes = analysis.model.mla_latent_kv_bytes(

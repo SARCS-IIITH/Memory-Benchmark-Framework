@@ -19,6 +19,13 @@ Two things keep it tractable, and both are load-bearing:
    which is cheap. Tier 2 then spends the expensive full-section budget on only the handful
    of kernels that tier 1 showed actually matter.
 
+How the passes are produced matters as much as how many there are. Kernel replay saves all
+GPU memory a kernel could touch before its first pass -- the whole weight buffer, ~50 GB on
+Kimi-Linear, per kernel -- which is both most of the time and a doubling of memory.
+Application replay re-runs the worker once per pass instead and saves nothing. The runner
+picks per backend through ``ncu.replay_mode`` (``auto``: application for llamacpp, kernel
+otherwise); see :class:`~nsight_bench.config.NcuConfig`.
+
 Tier 1 is optional (``ncu.tiers``) and off by default. On an eager mixture of experts a
 phase runs tens of thousands of launches, so tier 1 takes hours and still ends truncated at
 the launch cap.
@@ -166,6 +173,11 @@ class NcuRunner:
         estimate = int(layers * per_layer * 1.6) + 200
         return max(cfg.max_kernels, estimate)
 
+    @property
+    def replay_mode(self) -> str:
+        """The concrete ncu ``--replay-mode`` for this run's backend (see NcuConfig)."""
+        return self.run_config.profile.ncu.resolved_replay_mode(self.run_config.backend)
+
     def _common_flags(self, nvtx_range: str, report_stem: Path) -> list[str]:
         cfg = self.run_config.profile.ncu
         return [
@@ -179,7 +191,7 @@ class NcuRunner:
             # Kernels are identified by demangled base function name in both tiers, so the
             # names tier 1 reports can be fed straight back into tier 2's filter.
             "--kernel-name-base", "function",
-            "--replay-mode", cfg.replay_mode,
+            "--replay-mode", self.replay_mode,
             "--cache-control", cfg.cache_control,
             "--clock-control", cfg.clock_control,
             "--launch-count", str(self.launch_cap()),
@@ -313,6 +325,8 @@ class NcuRunner:
             "launch_cap_used": self.launch_cap(),
             "clock_control": cfg.clock_control,
             "cache_control": cfg.cache_control,
+            "replay_mode": self.replay_mode,
+            "replay_mode_setting": cfg.replay_mode,
             "collections": [c.to_dict() for c in collections],
             "truncated": bool(truncated),
             "warnings": warnings,

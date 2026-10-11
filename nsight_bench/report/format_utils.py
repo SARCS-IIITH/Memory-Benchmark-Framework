@@ -127,3 +127,42 @@ def markdown_table(headers: list[str], rows: list[list[str]], align: list[str] |
 def truncate(text: str, limit: int = 52) -> str:
     text = str(text)
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def cache_footprint_rows(footprint) -> list[list[str]]:
+    """The footprint table's decoding-cache rows, shared by the markdown and HTML reports.
+
+    The KV row shows the measured cache when the backend could see it (transformers), and
+    otherwise the analytic size in the engine's own layout (llama.cpp), saying which. For an
+    MLA model a second row puts the latent next to the expanded size and says which one
+    this run's engine actually held.
+    """
+    measured = footprint.kv_cache_bytes is not None
+    parts = footprint.cache_state_bytes if measured else footprint.analytic_cache_state_bytes
+    detail = (" -- " + ", ".join(f"{k} {fmt_bytes(v)}" for k, v in parts.items())
+              if len(parts) > 1 else "")
+    if measured or not parts:
+        value, source = footprint.kv_cache_bytes, "measured from the live cache tensors"
+    else:
+        value = sum(parts.values())
+        source = (f"analytic, in {footprint.cache_engine}'s cache layout -- the harness "
+                  "cannot see this engine's cache")
+    rows = [[
+        "KV cache" + (" + recurrent state" if parts.get("recurrent_state") else ""),
+        fmt_bytes(value), source + detail,
+    ]]
+    if footprint.mla_latent_kv_bytes:
+        if footprint.cache_engine == "llama.cpp":
+            rows.append([
+                "MLA latent", fmt_bytes(footprint.mla_latent_kv_bytes),
+                "what llama.cpp caches for MLA (K only, f16; part of the KV row above); "
+                "transformers would hold the expanded per-head K/V instead "
+                f"({fmt_bytes(footprint.mla_expanded_kv_bytes)})",
+            ])
+        else:
+            rows.append([
+                "MLA latent equivalent", fmt_bytes(footprint.mla_latent_kv_bytes),
+                "what an MLA-native engine would cache; transformers holds the expanded "
+                f"per-head K/V instead ({fmt_bytes(footprint.mla_expanded_kv_bytes)})",
+            ])
+    return rows

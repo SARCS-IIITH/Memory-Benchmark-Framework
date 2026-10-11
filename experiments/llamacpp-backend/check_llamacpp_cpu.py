@@ -95,6 +95,74 @@ def main() -> int:
     check("int32, contiguous (what llama_decode takes)",
           lc_ids.dtype == np.int32 and lc_ids.flags["C_CONTIGUOUS"])
 
+    print("ncu replay mode (auto: application for llamacpp, kernel otherwise)")
+    import tempfile
+
+    from nsight_bench.config import NcuConfig, ProfileConfig, RunConfig
+    from nsight_bench.platform import PlatformProfile
+    from nsight_bench.runners.base import RunPaths
+    from nsight_bench.runners.ncu_runner import NcuRunner
+
+    def replay_flag(backend: str, cfg: ModelConfig, setting: str | None = None) -> str:
+        profile = ProfileConfig.load(REPO / "configs/profiles/moe.yaml")
+        if setting:
+            profile.ncu.replay_mode = setting
+        run = RunConfig(model=cfg, workload=workload, profile=profile, backend=backend)
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = NcuRunner(run, RunPaths(Path(tmp)), PlatformProfile())
+            argv = runner.build_tier1_command(
+                Path(tmp) / "c.json", Path(tmp) / "r.json", "nsbench.prefill", Path(tmp) / "s"
+            )
+        return argv[argv.index("--replay-mode") + 1]
+
+    check("profiles default to auto", all(
+        ProfileConfig.load(p).ncu.replay_mode == "auto"
+        for p in sorted((REPO / "configs/profiles").glob("*.yaml"))))
+    check("llamacpp + auto -> application", replay_flag("llamacpp", gguf_cfg) == "application")
+    check("hf + auto -> kernel (unchanged)", replay_flag("hf", hf_cfg) == "kernel")
+    check("explicit kernel honoured on llamacpp", replay_flag("llamacpp", gguf_cfg, "kernel") == "kernel")
+    check("explicit application honoured on hf", replay_flag("hf", hf_cfg, "application") == "application")
+    try:
+        NcuConfig(replay_mode="range")
+        check("unsupported replay mode rejected", False)
+    except ValueError:
+        check("unsupported replay mode rejected", True)
+
+    print("Cache sizing follows the engine (llama.cpp: latent MLA)")
+    from nsight_bench.analysis.assemble import RunAnalysis
+    from nsight_bench.config import cache_engine_for_backend
+
+    kimi_q8 = ModelConfig.load(REPO / "configs/models/kimi-linear-48b-q8-gguf.yaml")
+    # llama.cpp's own allocation log for this GGUF (CPU context, 2026-10-12):
+    #   256 cells:    K (f16) 1.97 MiB, V 0.00 MiB, 7 layers; R (f32) 2.81 MiB, S (f32) 40.00 MiB
+    #   16,640 cells: K (f16) 127.97 MiB
+    lc256 = kimi_q8.kv_cache_breakdown(256, engine="llama.cpp")
+    check("llama.cpp MLA cache = latent, K only (256 cells: 2,064,384 B = 1.97 MiB)",
+          lc256.get("kv") == 2_064_384, str(lc256.get("kv")))
+    check("llama.cpp MLA cache at 16,640 cells = 127.97 MiB",
+          kimi_q8.kv_cache_breakdown(16_640, engine="llama.cpp").get("kv") == 134_184_960)
+    check("llama.cpp KDA state S = 40.00 MiB", lc256.get("recurrent_state") == 41_943_040)
+    check("llama.cpp KDA conv state R = 2.81 MiB (kernel-1, f32)",
+          lc256.get("conv_state") == 2_949_120, str(lc256.get("conv_state")))
+    hf160 = kimi_q8.kv_cache_breakdown(160)
+    check("transformers layout unchanged (expanded MLA 22.94 MB at 160 tokens)",
+          hf160 == {"kv": 22_937_600, "recurrent_state": 41_943_040, "conv_state": 1_966_080},
+          str(hf160))
+    check("kv_cache_bytes passes the engine through",
+          kimi_q8.kv_cache_bytes(160, engine="llama.cpp") == 46_182_400)
+    check("backend -> engine: llamacpp -> llama.cpp, hf -> transformers",
+          cache_engine_for_backend("llamacpp") == "llama.cpp"
+          and cache_engine_for_backend("hf") == "transformers")
+    check("RunAnalysis picks the engine from the run's backend",
+          RunAnalysis(manifest={"config": {"backend": "llamacpp"}}).cache_engine == "llama.cpp"
+          and RunAnalysis(manifest={"config": {"backend": "hf"}}).cache_engine == "transformers"
+          and RunAnalysis(manifest={}).cache_engine == "transformers")
+    try:
+        kimi_q8.kv_cache_breakdown(160, engine="vllm")
+        check("unknown cache engine rejected", False)
+    except ValueError:
+        check("unknown cache engine rejected", True)
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} check(s) FAILED: " + "; ".join(FAILURES))
