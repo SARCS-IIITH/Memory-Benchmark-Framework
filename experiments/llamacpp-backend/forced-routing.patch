@@ -1,0 +1,185 @@
+nsbench forced MoE routing for llama.cpp (llama-cpp-python 0.3.36, vendored llama.cpp
+0c1e57098bba43ac29e6e3b677cdceebdd22334f). Apply inside the llama.cpp tree with `patch -p1`.
+
+LLAMA_MOE_FORCE_ROUTING=fixed|disjoint replaces the router's top-k in build_moe_ffn with ids
+from a graph input, the same ids as the hf hook (nsight_bench/compat/routing.py). Unset or
+"natural": no input is created and the graph is unchanged. LLAMA_MOE_FORCE_ROUTING_DEBUG=1
+prints each pass's ids to stderr. llama_nsbench_forced_routing() marks a patched build.
+Built into ~/envs/nsbench-moeroute; checked by check_forced_routing_cpu.py next to this file.
+
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -215,6 +215,30 @@
+     const llama_kv_cache_context * mctx;
+ };
+ 
++// nsbench forced MoE routing (env LLAMA_MOE_FORCE_ROUTING=fixed|disjoint): expert ids
++// replacing the router's top-k, the same for every MoE layer of a pass. Mirrors the HF hook in
++// Memory-Benchmark-Framework nsight_bench/compat/routing.py.
++class llm_graph_input_moe_route : public llm_graph_input_i {
++public:
++    llm_graph_input_moe_route(int mode, int64_t n_expert, int64_t n_expert_used)
++        : mode(mode), n_expert(n_expert), n_expert_used(n_expert_used) {}
++    virtual ~llm_graph_input_moe_route() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    bool can_reuse(const llm_graph_params & params) override;
++
++    ggml_tensor * ids     = nullptr; // I32 [n_expert_used, n_tokens]
++    ggml_tensor * ids_out = nullptr; // I32 [n_expert_used, n_outputs], rows of the output tokens
++
++    const int     mode; // 1 = fixed, 2 = disjoint
++    const int64_t n_expert;
++    const int64_t n_expert_used;
++};
++
++// 0 = natural (unset), 1 = fixed, 2 = disjoint; aborts on anything else
++int llama_moe_force_routing_mode();
++
+ class llm_graph_input_out_ids : public llm_graph_input_i {
+ public:
+     llm_graph_input_out_ids(
+@@ -1039,6 +1063,9 @@
+     llm_graph_result * res;
+ 
+     ggml_context * ctx0 = nullptr;
++
++    // nsbench forced MoE routing: created by the first MoE layer of the graph, shared by the rest
++    mutable llm_graph_input_moe_route * inp_moe_route = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
+     llm_graph_context(const llm_graph_params & params);
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -223,6 +223,77 @@
+     }
+ }
+ 
++int llama_moe_force_routing_mode() {
++    const char * env = getenv("LLAMA_MOE_FORCE_ROUTING");
++    if (env == nullptr || env[0] == '\0' || strcmp(env, "natural") == 0) {
++        return 0;
++    }
++    if (strcmp(env, "fixed") == 0) {
++        return 1;
++    }
++    if (strcmp(env, "disjoint") == 0) {
++        return 2;
++    }
++    GGML_ABORT("LLAMA_MOE_FORCE_ROUTING=%s: expected natural, fixed or disjoint", env);
++}
++
++void llm_graph_input_moe_route::set_input(const llama_ubatch * ubatch) {
++    // Counts passes (ubatches) since the process started, so every process -- every ncu
++    // application-replay pass -- sees the same sequence of ids.
++    static int64_t n_calls = 0;
++
++    const int64_t n_tokens = ubatch->n_tokens;
++    const int64_t k        = n_expert_used;
++
++    // Token t takes experts offset + t*k .. offset + t*k + k-1 (mod n_expert); the offset
++    // advances by the whole pass each call. fixed: experts 0..k-1 for every token.
++    const int64_t offset = mode == 2 ? (n_calls * n_tokens * k) % n_expert : 0;
++    std::vector<int32_t> data(n_tokens*k);
++    for (int64_t t = 0; t < n_tokens; ++t) {
++        for (int64_t j = 0; j < k; ++j) {
++            data[t*k + j] = mode == 2 ? (int32_t) ((offset + t*k + j) % n_expert) : (int32_t) j;
++        }
++    }
++    n_calls++;
++
++    // env LLAMA_MOE_FORCE_ROUTING_DEBUG=1: one line per pass with every token's ids, for the
++    // nsbench CPU check against the hf hook's formula
++    static const bool debug_ids = getenv("LLAMA_MOE_FORCE_ROUTING_DEBUG") != nullptr;
++    if (debug_ids) {
++        fprintf(stderr, "nsbench_moe_route call=%lld tokens=%lld out_rows=%lld ids=",
++                (long long) (n_calls - 1), (long long) n_tokens,
++                (long long) (ids_out ? ids_out->ne[1] : 0));
++        for (size_t i = 0; i < data.size(); ++i) {
++            fprintf(stderr, "%s%d", i ? "," : "", data[i]);
++        }
++        fprintf(stderr, "\n");
++    }
++
++    if (ids) {
++        GGML_ASSERT(ids->ne[1] == n_tokens);
++        ggml_backend_tensor_set(ids, data.data(), 0, data.size()*sizeof(int32_t));
++    }
++    if (ids_out) {
++        std::vector<int32_t> out;
++        out.reserve(ids_out->ne[1]*k);
++        for (int64_t t = 0; t < n_tokens; ++t) {
++            if (ubatch->output == nullptr || ubatch->output[t] || ids_out->ne[1] == n_tokens) {
++                out.insert(out.end(), data.begin() + t*k, data.begin() + (t + 1)*k);
++            }
++        }
++        GGML_ASSERT((int64_t) out.size() == ids_out->ne[1]*k);
++        ggml_backend_tensor_set(ids_out, out.data(), 0, out.size()*sizeof(int32_t));
++    }
++}
++
++bool llm_graph_input_moe_route::can_reuse(const llm_graph_params & params) {
++    bool res = true;
++    res &= mode == llama_moe_force_routing_mode();
++    res &= ids     == nullptr || ids->ne[1]     == params.ubatch.n_tokens;
++    res &= ids_out == nullptr || ids_out->ne[1] == params.n_outputs;
++    return res;
++}
++
+ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
+     bool res = true;
+ 
+@@ -2119,6 +2190,27 @@
+ 
+     // select experts
+     ggml_tensor * selected_experts = selected_experts_in;
++    if (selected_experts == nullptr && hparams.n_expert_groups <= 1 && n_expert_used <= n_expert) {
++        // nsbench forced routing: replace the router's top-k with ids from a graph input.
++        const int mode = llama_moe_force_routing_mode();
++        if (mode != 0) {
++            if (inp_moe_route == nullptr) {
++                auto inp = std::make_unique<llm_graph_input_moe_route>(mode, n_expert, n_expert_used);
++                inp_moe_route = inp.get();
++                res->add_input(std::move(inp));
++            }
++            const int64_t n_tok = cur->ne[1];
++            ggml_tensor ** slot = n_tok == this->n_tokens ? &inp_moe_route->ids
++                                : n_tok == this->n_outputs ? &inp_moe_route->ids_out : nullptr;
++            GGML_ASSERT(slot != nullptr && "forced routing: MoE input is neither all tokens nor the outputs");
++            if (*slot == nullptr) {
++                *slot = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tok);
++                ggml_set_input(*slot);
++                ggml_set_name(*slot, slot == &inp_moe_route->ids ? "inp_moe_route" : "inp_moe_route_out");
++            }
++            selected_experts = *slot;
++        }
++    }
+     if (selected_experts == nullptr) {
+         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+         cb(selected_experts->src[0], "ffn_moe_argsort", il);
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -99,6 +99,10 @@
+     return llama_mlock::SUPPORTED;
+ }
+ 
++int32_t llama_nsbench_forced_routing(void) {
++    return 1;
++}
++
+ bool llama_supports_gpu_offload(void) {
+     if (!ggml_backend_reg_count()) {
+         ggml_backend_load_all();
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -567,6 +567,9 @@
+     LLAMA_API bool llama_supports_mmap       (void);
+     LLAMA_API bool llama_supports_mlock      (void);
+     LLAMA_API bool llama_supports_gpu_offload(void);
++
++    // nsbench patch marker: this build honours LLAMA_MOE_FORCE_ROUTING=fixed|disjoint. Returns 1.
++    LLAMA_API int32_t llama_nsbench_forced_routing(void);
+     LLAMA_API bool llama_supports_rpc        (void);
+ 
+     // NOTE: After creating a llama_context, it is recommended to query the actual values using these functions

@@ -26,9 +26,10 @@ Application replay re-runs the worker once per pass instead and saves nothing. T
 picks per backend through ``ncu.replay_mode`` (``auto``: application for llamacpp, kernel
 otherwise); see :class:`~nsight_bench.config.NcuConfig`.
 
-Tier 1 is optional (``ncu.tiers``) and off by default. On an eager mixture of experts a
-phase runs tens of thousands of launches, so tier 1 takes hours and still ends truncated at
-the launch cap.
+Tier 1 is optional (``ncu.tiers``): off by default under hf, on by default under llamacpp
+(``ncu.auto_tier1``). On an eager mixture of experts under hf a phase runs tens of thousands
+of launches, so tier 1 takes hours and still ends truncated at the launch cap; llama.cpp runs
+~1-2k per phase and application replay makes that ~30 min.
 
 Tier 2 needs a top-N kernel list, which comes from ``ncu.rank_source``:
 
@@ -178,6 +179,11 @@ class NcuRunner:
         """The concrete ncu ``--replay-mode`` for this run's backend (see NcuConfig)."""
         return self.run_config.profile.ncu.resolved_replay_mode(self.run_config.backend)
 
+    @property
+    def tiers(self) -> tuple[int, ...]:
+        """The tiers collected for this run's backend (see NcuConfig.resolved_tiers)."""
+        return self.run_config.profile.ncu.resolved_tiers(self.run_config.backend)
+
     def _common_flags(self, nvtx_range: str, report_stem: Path) -> list[str]:
         cfg = self.run_config.profile.ncu
         return [
@@ -270,12 +276,13 @@ class NcuRunner:
         collections: list[NcuCollection] = []
         gpu_windows: dict[str, dict] = {}
         ranking: dict[str, dict] = {}
-        deep_tiers = sorted(t for t in cfg.tiers if t >= 2)
+        tiers = self.tiers
+        deep_tiers = sorted(t for t in tiers if t >= 2)
         nsys_ranked: dict[str, list[str]] | None = None
 
         for scope, nvtx_range in SCOPES:
             tier1: NcuCollection | None = None
-            if 1 in cfg.tiers:
+            if 1 in tiers:
                 with GpuStateRecorder() as gpu:
                     tier1 = self._collect_tier1(config_path, scope, nvtx_range)
                 collections.append(tier1)
@@ -317,7 +324,9 @@ class NcuRunner:
         return {
             "runner": self.name,
             "scopes": [s for s, _ in SCOPES],
-            "tiers": list(cfg.tiers),
+            "tiers": list(tiers),
+            "tiers_setting": list(cfg.tiers),
+            "auto_tier1": cfg.auto_tier1,
             "rank_source": cfg.rank_source,
             "ranking": ranking,
             "top_n_kernels": cfg.top_n_kernels,

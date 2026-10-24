@@ -235,7 +235,7 @@ The work is split in two, done in order:
 4. **Convert the model** to BF16 GGUF in a separate venv (`~/envs/llamacpp`), so the `nsbench` env is not touched. Output to `~/ai-models/gguf/Qwen3-0.6B-bf16.gguf`.
 5. **Sanity check**: one short `llama-cli` prompt to confirm the output is fluent.
 6. **Testbench runs**, fresh, the same day, on `decode-focused`: one with `--skip-ncu` and one with `--tiers 1,2` (exact DRAM bytes and the decode physics check).
-7. **llama-bench speed run**, no profiler: `scripts/run_llamabench_qwen.sh`. Two invocations, because `-d` applies to every test in one: prefill `-p 128 -n 0 -d 0` (from an empty context, like the testbench) and decode `-p 0 -n 128 -d 128` (after 128 cached tokens). Saves JSON, a markdown table and a metadata file (commit, GGUF size, GPU clocks) under `runs/llamacpp-qwen/`.
+7. **llama-bench speed run**, no profiler: `scripts/run_llamabench_qwen.sh`. Two invocations, because `-d` applies to every test in one: prefill `-p 128 -n 0 -d 0` (from an empty context, like the testbench) and decode `-p 0 -n 128 -d 128` (after 128 cached tokens). Saves JSON, a markdown table and a metadata file (commit, GGUF size, GPU clocks) under `results/qwen3-0.6b-bf16-gguf__llamacpp/`.
 8. **Fill in section 7** and update progress.md.
 
 ### 6.4 Phase 1 setup log (2026-10-09)
@@ -272,11 +272,11 @@ All on 2026-10-09 except the first:
 
 | Name | Run | Notes |
 |---|---|---|
-| Earlier testbench | `runs/20261005T203205Z__Qwen3-0.6B__decode-focused__hf__l2check` | 2026-10-06, ncu tier 1 + 2. Kept for reference. |
-| Testbench, no ncu | `runs/20261009T164538Z__Qwen3-0.6B__decode-focused__hf__llamacpp-cmp` | 22:15 |
-| Testbench, tier 1 + 2 | `runs/20261009T171859Z__Qwen3-0.6B__decode-focused__hf__llamacpp-cmp-t1` | 22:48–23:25. Adds exact memory bytes from ncu. |
-| llama.cpp | `runs/llamacpp-qwen/llamabench-20261009-2334-*` | 23:34, 10 repetitions. An earlier 5-repetition run (`…-2333-*`) agrees within 2%. |
-| llama.cpp inside the testbench (phase 2) | `runs/20261009T184419Z__Qwen3-0.6B__decode-focused__llamacpp__llamacpp-bench-t1` | 2026-10-10 00:14–00:28, `--backend llamacpp`, ncu tier 1 + 2, token mode `bench`. Same GGUF, same llama.cpp commit as `llama-bench`. |
+| Earlier testbench | `results/qwen3-0.6b-bf16__hf-transformers/l2-sampling-check/20261005T203205Z__Qwen3-0.6B__decode-focused__hf__l2check` | 2026-10-06, ncu tier 1 + 2. Kept for reference. |
+| Testbench, no ncu | `results/qwen3-0.6b-bf16__hf-transformers/llamacpp-comparison/20261009T164538Z__Qwen3-0.6B__decode-focused__hf__llamacpp-cmp` | 22:15 |
+| Testbench, tier 1 + 2 | `results/qwen3-0.6b-bf16__hf-transformers/llamacpp-comparison/20261009T171859Z__Qwen3-0.6B__decode-focused__hf__llamacpp-cmp-t1` | 22:48–23:25. Adds exact memory bytes from ncu. |
+| llama.cpp | `results/qwen3-0.6b-bf16-gguf__llamacpp/llama-bench/llamabench-20261009-2334-*` | 23:34, 10 repetitions. An earlier 5-repetition run (`…-2333-*`) agrees within 2%. |
+| llama.cpp inside the testbench (phase 2) | `results/qwen3-0.6b-bf16-gguf__llamacpp/bringup/20261009T184419Z__Qwen3-0.6B__decode-focused__llamacpp__llamacpp-bench-t1` | 2026-10-10 00:14–00:28, `--backend llamacpp`, ncu tier 1 + 2, token mode `bench`. Same GGUF, same llama.cpp commit as `llama-bench`. |
 
 All timings are **medians**. The testbench reports the median of 5 timed repeats after 3 discarded warm-up rounds. For llama.cpp, the median is taken from the per-repetition samples in the JSON, not `llama-bench`'s printed average (why: 7.7).
 
@@ -389,7 +389,7 @@ The same model got opposite diagnoses depending on the engine. "What limits this
 
 Phase 1 answered **how much faster** llama.cpp is. Phase 2 runs the same llama.cpp engine inside the testbench (section 2.4), so it gets the same full report as HF transformers and shows **why**.
 
-Run: `runs/20261009T184419Z__Qwen3-0.6B__decode-focused__llamacpp__llamacpp-bench-t1`, all four stages ok, no warnings. Same workload (128 → 128, batch 1, 5 repeats after 3 warm-ups) and same ncu depth (tier 1 + 2) as the HF tier 1 + 2 run. Token mode `bench`, which copies `llama-bench`'s loop: predetermined tokens, no read-back of the output, and a wait for the GPU after every token (7.8.6).
+Run: `results/qwen3-0.6b-bf16-gguf__llamacpp/bringup/20261009T184419Z__Qwen3-0.6B__decode-focused__llamacpp__llamacpp-bench-t1`, all four stages ok, no warnings. Same workload (128 → 128, batch 1, 5 repeats after 3 warm-ups) and same ncu depth (tier 1 + 2) as the HF tier 1 + 2 run. Token mode `bench`, which copies `llama-bench`'s loop: predetermined tokens, no read-back of the output, and a wait for the GPU after every token (7.8.6).
 
 #### 7.8.1 The check: does the testbench slow llama.cpp down?
 

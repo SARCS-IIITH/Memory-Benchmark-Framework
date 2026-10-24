@@ -10,7 +10,7 @@
 # Memory guard: if MemAvailable stays under GUARD_MB for GUARD_SECONDS, the run's process tree
 # is killed. A failed run is better than another machine-wide outage on a shared box.
 #
-# Logs START / DONE / FAIL to runs/moe-queue/queue.log in the queue's own format, so
+# Logs START / DONE / FAIL to runs/kimi-fp8-safetensors-hf/moe-queue/queue.log in the queue's own format, so
 # scripts/summarize_moe_queue.py picks the result up.
 
 set -uo pipefail
@@ -18,8 +18,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 NSBENCH="${HOME}/envs/nsbench/bin/nsbench"
 NAME=moe-longctx-natural-p16384
-QLOG=runs/moe-queue/queue.log
-RUN_LOG="runs/moe-queue/22-${NAME}-rerun-skip-ncu.log"
+QLOG=runs/kimi-fp8-safetensors-hf/moe-queue/queue.log
+RUN_LOG="runs/kimi-fp8-safetensors-hf/moe-queue/22-${NAME}-rerun-skip-ncu.log"
 GUARD_MB="${GUARD_MB:-2000}"
 GUARD_SECONDS="${GUARD_SECONDS:-60}"
 

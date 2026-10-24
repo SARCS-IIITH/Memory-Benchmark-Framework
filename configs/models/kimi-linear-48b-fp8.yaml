@@ -1,4 +1,4 @@
-name: kimi-linear-48b-fp8
+piname: kimi-linear-48b-fp8
 path: /home/imc/ai-models/hub/models--nm-testing--Kimi-Linear-48B-A3B-Instruct-FP8-DYNAMIC/snapshots/c3a71758d772dc8ff6c207a034a722cb8decff77
 dtype: bfloat16
 attn_implementation: sdpa

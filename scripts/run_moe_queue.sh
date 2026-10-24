@@ -11,7 +11,7 @@
 # bytes come from nsys-sampled L2 traffic (configs/profiles/moe.yaml).
 #
 # One run failing does not stop the queue. Every start and finish is appended to
-# runs/moe-queue/queue.log as one line, so progress can be read, or the queue resumed, after
+# runs/kimi-fp8-safetensors-hf/moe-queue/queue.log as one line, so progress can be read, or the queue resumed, after
 # a disconnect. Runs already marked DONE in queue.log are skipped on a restart.
 #
 # Before each run the GPU must have no compute processes; the queue waits (polling each
@@ -26,7 +26,7 @@ cd "${REPO}"
 
 MODEL="${MODEL:-configs/models/kimi-linear-48b-fp8.yaml}"
 PROFILE="${PROFILE:-configs/profiles/moe.yaml}"
-QDIR="runs/moe-queue"
+QDIR="runs/kimi-fp8-safetensors-hf/moe-queue"
 QLOG="${QDIR}/queue.log"
 mkdir -p "${QDIR}"
 

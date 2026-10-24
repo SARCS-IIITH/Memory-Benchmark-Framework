@@ -56,7 +56,7 @@ Files: [experiments/nsys-gpu-metrics/](../experiments/nsys-gpu-metrics/).
 
 ### The run
 
-- `runs/20261005T203205Z__Qwen3-0.6B__decode-focused__hf__l2check` (2026-10-06 02:02–02:35)
+- `results/qwen3-0.6b-bf16__hf-transformers/l2-sampling-check/20261005T203205Z__Qwen3-0.6B__decode-focused__hf__l2check` (2026-10-06 02:02–02:35)
 - Decode-focused workload: 128 → 128 tokens, batch 1
 - ncu tier 1 on, giving exact memory bytes. ncu covered **all** kernels: 1,594 prefill and 1,618 decode, not truncated.
 - nsys used the L2-extended metric set, through a platform-profile override, with no code change.
@@ -156,7 +156,7 @@ On a small dense model, tier 1 is practical. Qwen3-0.6B has ~1,600 launches per 
 
 ### Which to use
 
-- **Comparing routing modes, batch sizes or prompt lengths on Kimi:** no ncu is enough. Bytes, time, expert counts and launches come from baseline and nsys. Tier 2 adds stall reasons, but its sample mostly misses the expert kernels. For which of the 22 MoE runs had tier 2 and why, see `runs/moe-queue/findings.md`, "ncu coverage".
+- **Comparing routing modes, batch sizes or prompt lengths on Kimi:** no ncu is enough. Bytes, time, expert counts and launches come from baseline and nsys. Tier 2 adds stall reasons, but its sample mostly misses the expert kernels. For which of the 22 MoE runs had tier 2 and why, see `results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/findings.md`, "ncu coverage".
 - **Why a kernel is slow:** tier 2. On Kimi, make it sample later layers first, e.g. per-layer NVTX ranges via `--annotate-layers`.
 - **Exact DRAM bytes:** tier 1, practical on small dense models. On Kimi the realistic route would be a reduced tier 1 (about 12 counters, decode only, one step), accepting hours of runtime and the memory risk. Better: fix Kimi's per-expert kernel loop first, so there are far fewer kernels to profile.
 - **Never run ncu on Kimi long-context prefill on this machine** (progress.md caveat 12).

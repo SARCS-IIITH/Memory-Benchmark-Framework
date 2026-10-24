@@ -1270,14 +1270,23 @@ class NcuConfig:
     #: 2 = full sections on the heaviest kernels.
     #: 3 = adds source-level attribution.
     #:
-    #: Tier 1 is off by default. It replays every launch in scope about 15 times, which is
-    #: tolerable for a dense model (~1,600 launches per decode step) but not for an eager MoE
-    #: (Kimi-Linear: ~12,000 per decode step and ~190,000 per prefill, i.e. many hours that
-    #: still end truncated at the launch cap). Add 1 back (``tiers: [1, 2]`` or
-    #: ``--tiers 1,2``) whenever the byte totals are wanted. Under application replay
-    #: (:attr:`replay_mode`) its cost is roughly passes x (~15 s + launches x ~27 ms): about
-    #: 30 min for Kimi-Linear through llama.cpp (1,864 + 1,306 launches); measured 2026-10-11, see progress.md.
+    #: Tier 1 is off in the profiles except on the llamacpp backend (:attr:`auto_tier1`). It
+    #: replays every launch in scope about 15 times, which is tolerable for a dense model
+    #: (~1,600 launches per decode step) but not for an eager MoE under hf (Kimi-Linear:
+    #: ~12,000 per decode step and ~190,000 per prefill, i.e. many hours that still end
+    #: truncated at the launch cap). Add 1 back (``tiers: [1, 2]`` or ``--tiers 1,2``)
+    #: whenever the byte totals are wanted. Under application replay (:attr:`replay_mode`)
+    #: its cost is roughly passes x (~15 s + launches x ~27 ms): about 30 min for
+    #: Kimi-Linear through llama.cpp (1,864 + 1,306 launches); measured 2026-10-11, see
+    #: progress.md.
     tiers: tuple[int, ...] = (2,)
+
+    #: Add tier 1 to :attr:`tiers` on the llamacpp backend. There it is cheap (application
+    #: replay, ~1-2k launches per phase) and it is the only source of exact DRAM bytes, so
+    #: it is on unless someone says otherwise. Passing ``--tiers`` clears this, so the tiers
+    #: given there are used exactly (``--tiers 2`` = no tier 1 on llamacpp either). See
+    #: :meth:`resolved_tiers`.
+    auto_tier1: bool = True
 
     #: Where tier 2+ gets its top-N kernel list: "nsys" (GPU time per kernel from the nsys
     #: timeline, attributed to the phase through the launching NVTX range) or "tier1" (tier
@@ -1364,6 +1373,12 @@ class NcuConfig:
         if self.replay_mode != "auto":
             return self.replay_mode
         return "application" if backend == "llamacpp" else "kernel"
+
+    def resolved_tiers(self, backend: str) -> tuple[int, ...]:
+        """The tiers collected for ``backend``: :attr:`tiers`, plus 1 on llamacpp (auto)."""
+        if self.auto_tier1 and backend == "llamacpp" and 1 not in self.tiers:
+            return tuple(sorted({1, *self.tiers}))
+        return self.tiers
 
 
 @dataclass

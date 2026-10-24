@@ -72,12 +72,13 @@ def main() -> int:
 
     print("Input validation (raised before any weights load)")
     wide = WorkloadConfig.load(REPO / "configs/workloads/decode-focused.yaml")
-    wide.batch_size = 4
+    # batch > 1 is supported since 2026-10-13 (check_batch_cpu.py); only a nonsense size is refused.
+    wide.batch_size = 0
     try:
         llamacpp.LlamaCppBackend(gguf_cfg, wide).load()
-        check("batch_size > 1 rejected", False)
+        check("batch_size < 1 rejected", False)
     except ValueError:
-        check("batch_size > 1 rejected", True)
+        check("batch_size < 1 rejected", True)
     try:
         llamacpp.LlamaCppBackend(hf_cfg, workload).load()
         check("non-GGUF path rejected", False)
@@ -127,6 +128,27 @@ def main() -> int:
         check("unsupported replay mode rejected", False)
     except ValueError:
         check("unsupported replay mode rejected", True)
+
+    print("ncu tier 1 (auto: on for llamacpp, profile's tiers otherwise)")
+    from nsight_bench.cli import _build_run_config, build_parser
+
+    def run_tiers(backend: str, model: str, *extra: str) -> tuple[int, ...]:
+        args = build_parser().parse_args([
+            "run", "--model", f"configs/models/{model}", "--backend", backend,
+            "--workload", "configs/workloads/moe/moe-decode-natural-b1.yaml",
+            "--profile", "configs/profiles/moe.yaml", *extra])
+        run = _build_run_config(args)
+        with tempfile.TemporaryDirectory() as tmp:
+            return tuple(NcuRunner(run, RunPaths(Path(tmp)), PlatformProfile()).tiers)
+
+    check("llamacpp + moe.yaml -> tiers 1,2", run_tiers("llamacpp", "kimi-linear-48b-q8-gguf.yaml") == (1, 2))
+    check("hf + moe.yaml -> tier 2 only (unchanged)", run_tiers("hf", "kimi-linear-48b-q8-gguf.yaml") == (2,))
+    check("explicit --tiers 2 honoured on llamacpp",
+          run_tiers("llamacpp", "kimi-linear-48b-q8-gguf.yaml", "--tiers", "2") == (2,))
+    check("explicit --tiers 1,2 honoured on hf",
+          run_tiers("hf", "kimi-linear-48b-q8-gguf.yaml", "--tiers", "1,2") == (1, 2))
+    check("auto_tier1: false in a profile turns it off",
+          NcuConfig(tiers=(2,), auto_tier1=False).resolved_tiers("llamacpp") == (2,))
 
     print("Cache sizing follows the engine (llama.cpp: latent MLA)")
     from nsight_bench.analysis.assemble import RunAnalysis

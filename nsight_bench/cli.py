@@ -267,6 +267,8 @@ def _build_run_config(args: argparse.Namespace) -> RunConfig:
         profile_config.ncu.auto_launch_cap = False
     if args.tiers:
         profile_config.ncu.tiers = tuple(int(t) for t in args.tiers.split(","))
+        # Explicit beats automatic: no tier 1 added on llamacpp behind the caller's back.
+        profile_config.ncu.auto_tier1 = False
     if args.rank_source:
         profile_config.ncu.rank_source = args.rank_source
     if args.replay_mode:
@@ -294,10 +296,12 @@ def cmd_run(args: argparse.Namespace) -> int:
           f"{run_config.workload.generate_tokens} generated, "
           f"batch {run_config.workload.batch_size}")
     ncu_cfg = run_config.profile.ncu
-    print(f"  ncu tiers  {list(ncu_cfg.tiers)}  "
+    tiers = ncu_cfg.resolved_tiers(run_config.backend)
+    print(f"  ncu tiers  {list(tiers)}  "
           f"(top {ncu_cfg.top_n_kernels} kernels deep-dived, ranked from "
-          f"{'nsys' if ncu_cfg.rank_source == 'nsys' else 'tier 1'})")
-    if 1 not in ncu_cfg.tiers:
+          f"{'nsys' if ncu_cfg.rank_source == 'nsys' else 'tier 1'})"
+          + ("  (tier 1 auto, llamacpp backend)" if tiers != ncu_cfg.tiers else ""))
+    if 1 not in tiers:
         print("             tier 1 off: no byte totals or decode physics check "
               "(--tiers 1,2 to add it)")
     replay = ncu_cfg.resolved_replay_mode(run_config.backend)
@@ -590,8 +594,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype")
     p.add_argument("--attn")
     p.add_argument("--profile", help="Profiler config YAML")
-    p.add_argument("--tiers", help="Comma-separated ncu tiers, e.g. '2' (default) or '1,2' "
-                                   "to add tier 1's byte totals and physics check")
+    p.add_argument("--tiers", help="Comma-separated ncu tiers, used exactly, e.g. '2' or '1,2' "
+                                   "to add tier 1's byte totals and physics check. Default: "
+                                   "the profile's tiers, plus tier 1 on the llamacpp backend")
     p.add_argument("--rank-source", choices=("nsys", "tier1"),
                    help="Where tier 2 gets its top-N kernels: the nsys timeline (default) or "
                         "tier 1's ncu export. Falls back to the other when it has no data")

@@ -1,6 +1,9 @@
 # Benchmark output. One directory per run; raw profiler reports run to hundreds of
 # megabytes each, well past GitHub's 100 MB per-file limit. Regenerate with `nsbench run`.
 runs/
+# Finished runs sorted by model and framework (same sizes); only the index is tracked.
+results/*
+!results/README.md
 
 # Python build and bytecode
 __pycache__/

@@ -1,4 +1,4 @@
-name: Qwen3-0.6B
+lsname: Qwen3-0.6B
 path: /home/imc/ai-models/gguf/Qwen3-0.6B-bf16.gguf
 dtype: bfloat16
 attn_implementation: sdpa

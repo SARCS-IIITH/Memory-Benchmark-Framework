@@ -18,6 +18,21 @@ How a decode step picks its input token is set by ``NSBENCH_LLAMACPP_TOKEN_MODE`
 
 Either way every token waits on the GPU: llama.cpp hands logits back to the host as part of
 each decode, so there is no equivalent of the ``hf`` backend keeping tokens on the device.
+
+Batch > 1 runs ``batch_size`` sequences side by side in one llama.cpp context, as the ``hf``
+backend runs a ``[batch, prompt]`` tensor: the same per-row prompt ids, one ``llama_decode`` of
+all ``batch x prompt`` tokens for the prefill (one ubatch, the last token of each row returning
+logits), then one ``llama_decode`` of ``batch`` tokens (one per sequence) per decode step. The
+context is the bindings' own context parameters with only ``n_ctx`` (``batch x (prompt +
+generate)``), ``n_batch``/``n_ubatch`` and ``n_seq_max`` changed. Batch 1 keeps the original
+single-sequence path untouched.
+
+Forced MoE routing (workload ``routing: fixed|disjoint``) needs a llama.cpp built with the
+nsbench patch (experiments/llamacpp-backend/forced-routing.patch, installed in
+~/envs/nsbench-moeroute). The patch reads ``LLAMA_MOE_FORCE_ROUTING`` and replaces the router's
+top-k with the same ids the ``hf`` hook forces (nsight_bench/compat/routing.py); this backend
+sets that variable from the workload, and refuses forced routing on an unpatched build rather
+than silently running natural routing under a forced label.
 """
 
 from __future__ import annotations
@@ -35,6 +50,16 @@ VENDORED_LLAMA_CPP_COMMIT = "0c1e57098bba43ac29e6e3b677cdceebdd22334f"
 
 TOKEN_MODES = ("bench", "greedy")
 
+#: Environment variable the forced-routing patch reads when it builds each graph.
+FORCE_ROUTING_ENV = "LLAMA_MOE_FORCE_ROUTING"
+
+
+def forced_routing_supported() -> bool:
+    """Whether the loaded llama.cpp library carries the nsbench forced-routing patch."""
+    import llama_cpp
+
+    return hasattr(llama_cpp.llama_cpp._lib, "llama_nsbench_forced_routing")
+
 
 @register
 class LlamaCppBackend(Backend):
@@ -49,6 +74,9 @@ class LlamaCppBackend(Backend):
         self._n_vocab: int = 0
         self._n_ctx: int = 0
         self._bench_tokens: list[int] = []
+        #: batch > 1 only: the context created with n_seq_max = batch, and its llama_batch
+        self._own_ctx: Any = None
+        self._batch: Any = None
         self.token_mode = os.environ.get("NSBENCH_LLAMACPP_TOKEN_MODE", "bench").lower()
         if self.token_mode not in TOKEN_MODES:
             raise ValueError(
@@ -59,14 +87,21 @@ class LlamaCppBackend(Backend):
 
     def load(self) -> None:
         wl = self.workload_config
-        if wl.batch_size != 1:
-            raise ValueError(
-                f"the llamacpp backend runs one sequence; batch_size={wl.batch_size} is not supported"
-            )
+        if wl.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {wl.batch_size}")
         if not str(self.model_config.path).endswith(".gguf"):
             raise ValueError(f"the llamacpp backend needs a .gguf file, got {self.model_config.path}")
 
         import llama_cpp
+
+        # Set (not inherited) every time, so a stray value can never force a natural run.
+        if wl.routing != "natural" and not forced_routing_supported():
+            raise ValueError(
+                f"routing={wl.routing} needs llama.cpp with the nsbench forced-routing patch "
+                "(~/envs/nsbench-moeroute, experiments/llamacpp-backend/forced-routing.patch); "
+                f"this llama-cpp-python ({llama_cpp.__file__}) does not have it"
+            )
+        os.environ[FORCE_ROUTING_ENV] = wl.routing
 
         # Just large enough for the workload, as llama-bench sizes its context
         # (n_prompt + n_gen + n_depth). llama.cpp may pad it; the value used is read back.
@@ -87,9 +122,21 @@ class LlamaCppBackend(Backend):
         self._ctx = self._llm._ctx.ctx
         vocab = llama_cpp.llama_model_get_vocab(self._llm._model.model)
         self._n_vocab = int(llama_cpp.llama_vocab_n_tokens(vocab))
+        if wl.batch_size > 1:
+            self._load_batch_context()
         self._n_ctx = int(llama_cpp.llama_n_ctx(self._ctx))
 
-        if self.token_mode == "bench":
+        if self.token_mode == "bench" and wl.batch_size > 1:
+            import torch
+
+            # Same generator and bounds as batch 1; one token per sequence per step.
+            generator = torch.Generator().manual_seed(wl.seed + 1)
+            low = min(1000, max(1, self._n_vocab // 10))
+            self._bench_tokens = torch.randint(
+                low, max(low + 1, self._n_vocab - 100), (wl.generate_tokens + 1, wl.batch_size),
+                generator=generator, dtype=torch.long,
+            ).tolist()
+        elif self.token_mode == "bench":
             import torch
 
             generator = torch.Generator().manual_seed(wl.seed + 1)
@@ -99,7 +146,39 @@ class LlamaCppBackend(Backend):
                 generator=generator, dtype=torch.long,
             ).tolist()
 
+    def _load_batch_context(self) -> None:
+        """A second context for ``batch_size`` sequences, alongside the bindings' own.
+
+        ``llama_cpp.Llama`` has no ``n_seq_max`` argument, so the context the run uses is made
+        here from a copy of the bindings' own context parameters (flash attention, threads,
+        cache types...), changing only what the batch needs. The bindings' single-sequence
+        context stays allocated but idle (its cache is a few tens of MB on Kimi).
+        """
+        import llama_cpp
+
+        wl = self.workload_config
+        params = llama_cpp.llama_context_params.from_buffer_copy(self._llm.context_params)
+        # Not unified: each sequence gets n_ctx / n_seq_max cells, i.e. prompt + generate.
+        params.n_ctx = wl.batch_size * (wl.prompt_tokens + wl.generate_tokens)
+        params.n_batch = params.n_ubatch = max(512, wl.batch_size * wl.prompt_tokens)
+        params.n_seq_max = wl.batch_size
+        ctx = llama_cpp.llama_init_from_model(self._llm._model.model, params)
+        if not ctx:
+            raise RuntimeError(
+                f"llama.cpp could not create a context for batch_size={wl.batch_size} "
+                f"(n_ctx={params.n_ctx}, n_ubatch={params.n_ubatch})"
+            )
+        self._own_ctx = self._ctx = ctx
+        self._batch = llama_cpp.llama_batch_init(params.n_batch, 0, 1)
+
     def teardown(self) -> None:
+        if self._own_ctx is not None:
+            import llama_cpp
+
+            if self._batch is not None:
+                llama_cpp.llama_batch_free(self._batch)
+            llama_cpp.llama_free(self._own_ctx)
+            self._own_ctx = self._batch = None
         if self._llm is not None:
             try:
                 self._llm.close()
@@ -143,7 +222,9 @@ class LlamaCppBackend(Backend):
             if encoded.numel() < wl.prompt_tokens:
                 repeats = (wl.prompt_tokens // max(1, encoded.numel())) + 1
                 encoded = encoded.repeat(repeats)
-            input_ids = encoded[: wl.prompt_tokens].unsqueeze(0)
+            input_ids = encoded[: wl.prompt_tokens].unsqueeze(0).expand(wl.batch_size, -1)
+        if wl.batch_size > 1:
+            return np.ascontiguousarray(input_ids.numpy(), dtype=np.int32)   # [batch, prompt]
         return np.ascontiguousarray(input_ids[0].numpy(), dtype=np.int32)
 
     def _hf_tokenizer(self):
@@ -174,6 +255,39 @@ class LlamaCppBackend(Backend):
         if rc != 0:
             raise RuntimeError(f"llama_decode returned {rc}")
 
+    def _decode_rows(self, rows, start_pos: int) -> None:
+        """One ``llama_decode`` of several sequences: row s of ``rows`` is sequence s, its
+        tokens at positions ``start_pos ..``; only each row's last token returns logits."""
+        import llama_cpp
+
+        b = self._batch
+        i = 0
+        for seq, row in enumerate(rows):
+            for j, tok in enumerate(row):
+                b.token[i] = int(tok)
+                b.pos[i] = start_pos + j
+                b.n_seq_id[i] = 1
+                b.seq_id[i][0] = seq
+                b.logits[i] = int(j == len(row) - 1)
+                i += 1
+        b.n_tokens = i
+        rc = llama_cpp.llama_decode(self._ctx, b)
+        if rc != 0:
+            raise RuntimeError(f"llama_decode returned {rc}")
+
+    def _argmax_rows(self, rows) -> list[int]:
+        """Greedy next token of each row after :meth:`_decode_rows` (batch index of its last token)."""
+        import numpy as np
+
+        import llama_cpp
+
+        out, i = [], 0
+        for row in rows:
+            i += len(row)
+            ptr = llama_cpp.llama_get_logits_ith(self._ctx, i - 1)
+            out.append(int(np.ctypeslib.as_array(ptr, shape=(self._n_vocab,)).argmax()))
+        return out
+
     def _argmax_last_logits(self) -> int:
         import numpy as np
 
@@ -187,6 +301,8 @@ class LlamaCppBackend(Backend):
 
         import llama_cpp
 
+        if self.workload_config.batch_size > 1:
+            return self._prefill_rows(inputs)
         # A fresh sequence each repeat. data=False clears the bookkeeping only, so no memset
         # kernel lands inside the prefill range.
         llama_cpp.llama_memory_clear(llama_cpp.llama_get_memory(self._ctx), False)
@@ -207,12 +323,50 @@ class LlamaCppBackend(Backend):
             kv_bytes=None,
         )
 
+    def _prefill_rows(self, inputs: Any) -> GenerationState:
+        import numpy as np
+
+        import llama_cpp
+
+        llama_cpp.llama_memory_clear(llama_cpp.llama_get_memory(self._ctx), False)
+        rows = [list(r) for r in inputs]
+        self._decode_rows(rows, 0)
+        if self.token_mode == "greedy":
+            next_tokens = self._argmax_rows(rows)
+        else:
+            llama_cpp.llama_synchronize(self._ctx)
+            next_tokens = self._bench_tokens[0]
+        token = np.array(next_tokens, dtype=np.int32).reshape(-1, 1)          # [batch, 1]
+        return GenerationState(cache=None, last_token_ids=token, position=len(rows[0]),
+                               generated_tokens=[token], kv_bytes=None)
+
+    def _decode_step_rows(self, state: GenerationState) -> GenerationState:
+        import numpy as np
+
+        import llama_cpp
+
+        rows = [[int(t)] for t in state.last_token_ids[:, 0]]
+        self._decode_rows(rows, state.position)
+        if self.token_mode == "greedy":
+            next_tokens = self._argmax_rows(rows)
+        else:
+            llama_cpp.llama_synchronize(self._ctx)
+            step = len(state.generated_tokens)
+            next_tokens = self._bench_tokens[step % len(self._bench_tokens)]
+        token = np.array(next_tokens, dtype=np.int32).reshape(-1, 1)
+        state.last_token_ids = token
+        state.position += 1
+        state.generated_tokens.append(token)
+        return state
+
     def decode_step(self, state: GenerationState) -> GenerationState:
         """One token: one ``llama_decode`` of a single position, then wait for it."""
         import numpy as np
 
         import llama_cpp
 
+        if self.workload_config.batch_size > 1:
+            return self._decode_step_rows(state)
         self._decode([int(state.last_token_ids[0, 0])])
         if self.token_mode == "greedy":
             next_token = self._argmax_last_logits()
@@ -239,7 +393,17 @@ class LlamaCppBackend(Backend):
             "n_gpu_layers": -1,
             "flash_attn": "enabled",
             "kv_cache_class": "llama.cpp KV cache (not measured; analytic estimate used)",
+            "routing": self.workload_config.routing,
+            "batch_size": self.workload_config.batch_size,
+            "n_seq_max": self.workload_config.batch_size,
         }
+        if self.workload_config.routing != "natural":
+            info["routing_warning"] = (
+                f"MoE routing was forced ({self.workload_config.routing}) by the nsbench llama.cpp "
+                "patch: the generated text is meaningless; only timing and traffic are "
+                "representative. Expert weights are the router's own scores for the forced "
+                "experts, renormalised (hf: uniform), so the router still runs"
+            )
         if self.token_mode == "bench":
             info["token_warning"] = (
                 "decode fed predetermined tokens without reading logits, as llama-bench does: "
@@ -249,6 +413,7 @@ class LlamaCppBackend(Backend):
             import llama_cpp
 
             info["llama_cpp_python_version"] = llama_cpp.__version__
+            info["forced_routing_patch"] = forced_routing_supported()
             if self._llm is not None:
                 model = self._llm._model.model
                 info["parameters"] = int(llama_cpp.llama_model_n_params(model))

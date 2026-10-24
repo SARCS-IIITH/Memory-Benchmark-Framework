@@ -2,6 +2,8 @@
 
 How the harness controls which experts a mixture-of-experts (MoE) model uses, why that matters for memory traffic, and what each of the MoE workloads should show. The numbers are for **Kimi-Linear-48B-A3B (FP8)**, the first MoE model run on this harness.
 
+> **Update (2026-10-13):** the same workloads are being re-run on the Q8_0 GGUF through **llama.cpp, with exact DRAM bytes (ncu tier 1)**, which this HF FP8 sweep never had: see [10-kimi-llamacpp-moe-sweep.md](10-kimi-llamacpp-moe-sweep.md). 11 of 22 done so far; the prefill bytes there match the expert counts observed in section 5, and forced routing brackets natural as predicted here. What carries over and what does not: progress.md, "HF MoE idle-time conclusions re-scoped" (launch-bound, idle shares and tok/s here are transformers' implementation, not the model).
+>
 > **Status (2026-10-06):** **all 22 workloads have run on the GPU; results are in [section 5](#5-measured-results-2026-10-06).** The batch-1 self-check passed (all three routing modes within 0.1%). The CPU test still passes (28/28, `experiments/kimi-linear-compat/check_routing_cpu.py`). Sections 1–4 are the design and the predictions as written before the runs; section 5 is what was measured.
 
 ---
@@ -189,7 +191,7 @@ Kimi's MoE code runs each *used* expert as separate small GPU jobs, and it stops
 ## 5. Measured results (2026-10-06)
 
 All 22 workloads ran on the DGX Spark on 2026-10-06 (runs 1–21 from `scripts/run_moe_queue.sh`, 03:14–13:44; long context re-run 16:07–16:20 after the first attempt crashed the machine, see 5.6). Every completed run passed every stage.
-- Raw per-run results and caveats: `runs/moe-queue/results.md` and `findings.md`.
+- Raw per-run results and caveats: `results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/results.md` and `findings.md`.
 - Run-by-run log: `progress.md`.
 
 **Read the GB figures with care.** The bytes here are **L2 traffic sampled by nsys**, not DRAM bytes; ncu tier 1, the only exact DRAM source, takes ~13 h per Kimi run ([08-nsys-l2-sampling.md](08-nsys-l2-sampling.md)). On Kimi, L2 traffic runs at about **1.9× the weight bytes a step needs** (5.5); DRAM itself was never measured on Kimi. So compare the GB *between* runs, not as absolute DRAM figures. Expert counts come from the routing observer (section 2) and are exact.
@@ -266,7 +268,7 @@ Per prefill. The 128-token row comes from the batch-1 decode runs (their prompt 
   - Routing doesn't change either.
   - Below **~292 tokens per sequence** the fixed KDA state is the larger part of the cache: ~2/3 of it in the 160-token decode sweep.
   - At 16k tokens MLA K/V is 98% of the cache. All-MLA attention would have needed ~9 GB there instead of 2.4 GB.
-  - Full table: `runs/moe-queue/results.md`, "KV cache and recurrent state".
+  - Full table: `results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/results.md`, "KV cache and recurrent state".
 - **But the cache costs ~2.9× its size in traffic per step** (+7.0 GB for a 2.4 GB cache). The cache in use is Kimi's own `KimiDynamicCache`, and its `update()` **does** rebuild each layer's K and V with `torch.cat` on every token (confirmed in `modeling_kimi.py`, 5.7). *Still a hypothesis:* that this explains the ~3×: each step reads the old cache, writes a new copy, then attention reads it, ≈ 3 × 2.4 GB. The traffic split itself was not measured.
 - **The MLA layers run as standard multi-head attention**, which is why the cache is the expanded 143 KB/token and not MLA's 8 KB/token. See 5.7.
 - **The time cost is modest** (+34 ms/step), because decode is launch-bound (5.5).
@@ -305,7 +307,7 @@ That is why natural uses about half the experts the formula predicts (5.1, 5.2).
 3. **Prompts are synthetic random token IDs.** Natural routing on real text may spread differently. Real-text prompts are still to do (section 8).
 4. **Large prefills:** L2 GB do not rank routing modes reliably (5.4). Use expert counts and time.
 5. **Forced routing makes the generated text meaningless.** Only the traffic is real.
-6. **Stall data (ncu tier 2) exists for 8 of the 22 runs only**, and its 60-launch sample covers only the first ~4–5 linear layers: it never reached the routed experts. **No routing conclusion in this section depends on ncu**; the ncu-based points (5.4 mechanism, 5.5 GEMM ratio) are marked ⚠️. Which runs and why: `runs/moe-queue/findings.md`, "ncu coverage".
+6. **Stall data (ncu tier 2) exists for 8 of the 22 runs only**, and its 60-launch sample covers only the first ~4–5 linear layers: it never reached the routed experts. **No routing conclusion in this section depends on ncu**; the ncu-based points (5.4 mechanism, 5.5 GEMM ratio) are marked ⚠️. Which runs and why: `results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/findings.md`, "ncu coverage".
 7. **The first long-context attempt, with ncu, crashed the DGX by exhausting memory.** The re-run without ncu is the one reported here. Never run ncu on Kimi long-context prefill on this machine. Why memory grew so far (~100 GB in one process): 5.7.
 8. **Batch-32 ncu runs were collected under memory pressure** (~190 driver allocation failures, no data lost). Timing and L2 come from separate processes and are unaffected.
 
@@ -332,14 +334,14 @@ So at run time **the MLA layers behave exactly like standard multi-head attentio
 
 The expanded cache is **17.8× larger** than MLA intends. On top of that, the cache class in use (`KimiDynamicCache`, recorded in the run manifest) grows each layer's K and V with `torch.cat` on **every token**, which builds a new, larger copy of the whole layer cache each step. That is the likely source of the extra decode traffic at long context (5.3).
 
-An inference engine that implements MLA properly caches the compressed form and doesn't copy the cache on every token. **llama.cpp does this for Kimi-Linear** (confirmed from its code, 2026-10-10, not yet from a run): its converter (`conversion/kimi_linear.py`) splits `kv_b_proj` into `k_b_proj` and `v_b_proj`, and its runtime (`src/models/kimi-linear.cpp`, "MLA KV cache enabled" branch) folds the key expansion into the query (`q_nope_absorbed`), caches only the 512 compressed + 64 position values per token as one key/value shared by all 32 query heads, and applies `v_b_proj` after attention. That is 8,064 B/token instead of 143,360 B, ~0.13 GB instead of 2.35 GB at 16k tokens. An older GGUF without the split takes a fallback branch that expands like transformers. To confirm on a run: the load log's "KV buffer size" line.
+An inference engine that implements MLA properly caches the compressed form and doesn't copy the cache on every token. **llama.cpp does this for Kimi-Linear** (confirmed from its code 2026-10-10, and since then from a CPU load of the Q8 GGUF and the GPU runs in docs/10: 8,064 B/token, K only): its converter (`conversion/kimi_linear.py`) splits `kv_b_proj` into `k_b_proj` and `v_b_proj`, and its runtime (`src/models/kimi-linear.cpp`, "MLA KV cache enabled" branch) folds the key expansion into the query (`q_nope_absorbed`), caches only the 512 compressed + 64 position values per token as one key/value shared by all 32 query heads, and applies `v_b_proj` after attention. That is 8,064 B/token instead of 143,360 B, ~0.13 GB instead of 2.35 GB at 16k tokens. An older GGUF without the split takes a fallback branch that expands like transformers. To confirm on a run: the load log's "KV buffer size" line.
 
 #### Which run the ~100 GB process was
 
 | Evidence | What it shows |
 |---|---|
-| `runs/moe-queue/queue.log`: `13:44:21 START 22/22 moe-longctx-natural-p16384 ncu=ncu` | At 14:20 the queue was on run 22, the 16,384-token long-context run, **with ncu on** |
-| `runs/20261006T081421Z__…__moe-longctx-natural-p16384__hf__moe/logs/ncu_tier2_prefill.stdout.log`, first line: `==PROF== Connected to process 330905` | **PID 330905 was the process being profiled by ncu tier 2 during the 16k-token prefill** |
+| `results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/queue.log`: `13:44:21 START 22/22 moe-longctx-natural-p16384 ncu=ncu` | At 14:20 the queue was on run 22, the 16,384-token long-context run, **with ncu on** |
+| `results/kimi-linear-48b-a3b-fp8__hf-transformers/20261006T081421Z__…__moe-longctx-natural-p16384__hf__moe/logs/ncu_tier2_prefill.stdout.log`, first line: `==PROF== Connected to process 330905` | **PID 330905 was the process being profiled by ncu tier 2 during the 16k-token prefill** |
 | Same log, last line: `Profiling "unrolled_elementwise_kernel": 0%` | ncu never finished profiling even its first kernel |
 
 So the ~100 GB was **run 22's ncu stage**: the stage that later ran the DGX out of memory (caveat 7 in 5.6; progress.md, run 22). The other 21 runs used short contexts, and their processes stayed at ~50–58 GB.
@@ -351,7 +353,7 @@ The ~100 GB is four things stacked on top of each other:
 | Part | Size | Where the number comes from |
 |---|---|---|
 | **1. FP8 weights** | **~50 GB** | Measured in every Kimi run: "Model weights resident" 50.01 GB |
-| **2. Working memory for a 16,384-token prefill** | **~8.8 GB** above the weights | Same workload without any profiler (re-run `runs/20261006T103757Z__…__moe-longctx-natural-p16384__hf__moe`): PyTorch peak allocated **58.82 GB** |
+| **2. Working memory for a 16,384-token prefill** | **~8.8 GB** above the weights | Same workload without any profiler (re-run `results/kimi-linear-48b-a3b-fp8__hf-transformers/20261006T103757Z__…__moe-longctx-natural-p16384__hf__moe`): PyTorch peak allocated **58.82 GB** |
 | …of which the **expanded MLA cache** | 2.35 GB (compressed would be 0.13 GB) | `cache_state_bytes.kv`, above |
 | …of which KDA recurrent + conv state | 0.04 GB | `cache_state_bytes`, flat at any context length |
 | …the rest: prefill activations for 16k tokens | ~6.4 GB | Hidden states, MoE intermediates and attention inputs for 16,384 tokens at once. In the short runs this is ~0–2 GB. |
@@ -375,7 +377,7 @@ The ~100 GB is four things stacked on top of each other:
 
 - **Never run ncu on a long-context prefill of a large model on this machine**, whichever engine runs it. The replay copies scale with the data each kernel touches. Long-context runs: `--skip-ncu` plus the memory guard in `scripts/rerun_moe_longctx.sh`.
 - **The MLA expansion is a property of HF transformers' Kimi code, not of the model.** Reports already show both cache sizes (expanded and compressed). An engine that keeps the compressed form would cut the 16k-token cache from 2.35 GB to 0.13 GB and remove the per-token `torch.cat` copy, but would not change parts 1, 2 (activations) or 4.
-- **llama.cpp (see [09-llamacpp-comparison.md](09-llamacpp-comparison.md) section 9.6)** would change parts 2 and 3: a compressed MLA cache (confirmed from its code, above), and memory reserved once at load instead of PyTorch's caching allocator. It would not change ncu's replay copies (part 4), so the rule above still applies.
+- **llama.cpp (see [09-llamacpp-comparison.md](09-llamacpp-comparison.md) section 9.6)** would change parts 2 and 3: a compressed MLA cache (confirmed from its code, above), and memory reserved once at load instead of PyTorch's caching allocator. It would not change ncu's *kernel*-replay copies (part 4); **update 2026-10-12:** ncu application replay avoids those copies altogether and is now the default for llama.cpp (peak ~57 GiB with ncu instead of ~105; progress.md, "ncu application replay test").
 
 ---
 
@@ -407,8 +409,8 @@ All 22, queued, inside tmux (GPU must be idle; the script waits if it is not):
 
 ```bash
 tmux new-session -d -s moe-queue -c ~/Memory-Benchmark-Framework "./scripts/run_moe_queue.sh; exec bash"
-tail -f runs/moe-queue/queue.log                            # one line per run
-~/envs/nsbench/bin/python scripts/summarize_moe_queue.py    # -> runs/moe-queue/results.md
+tail -f results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/queue.log                            # one line per run
+~/envs/nsbench/bin/python scripts/summarize_moe_queue.py    # -> results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/results.md
 ```
 
 One run by hand:

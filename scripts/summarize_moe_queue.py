@@ -1,6 +1,6 @@
-"""Summarise the MoE queue (scripts/run_moe_queue.sh) into runs/moe-queue/results.md.
+"""Summarise the MoE queue (scripts/run_moe_queue.sh) into results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/results.md.
 
-Reads runs/moe-queue/queue.log for finished runs, then each run's metrics/summary.json and
+Reads results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/queue.log for finished runs, then each run's metrics/summary.json and
 metrics/baseline_result.json. Safe to rerun at any time; it rewrites results.md from scratch.
 
     ~/envs/nsbench/bin/python scripts/summarize_moe_queue.py
@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-QDIR = REPO / "runs" / "moe-queue"
+QDIR = REPO / "results" / "kimi-linear-48b-a3b-fp8__hf-transformers" / "moe-queue"
 LINE = re.compile(r"^(\S+ \S+) (DONE|FAIL) (\S+) exit=(\d+) (\d+)min run=(\S+)")
 
 
@@ -131,7 +131,7 @@ def main() -> None:
         if status == "FAIL" or not (run_dir / "metrics" / "summary.json").exists():
             out.append(f"| {name} | **{status} exit {code}** after {minutes} min | " +
                        " | ".join("" for _ in titles[2:]) + " |")
-            all_notes.append((name, [f"{status}: see runs/moe-queue/*-{name}.log"]))
+            all_notes.append((name, [f"{status}: see results/kimi-linear-48b-a3b-fp8__hf-transformers/moe-queue/*-{name}.log"]))
             continue
         row, notes = summarise_run(name, run_dir)
         out.append("| " + " | ".join(str(row[k]) for k in header) + " |")
